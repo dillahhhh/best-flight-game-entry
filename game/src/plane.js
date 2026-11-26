@@ -8,7 +8,9 @@ function makePlane(world) {
   const plane = {
     x: S.x, y: S.y, z: S.z, yaw: S.yaw, pitch: 0, roll: 0,
     speed: S.speed, throttle: 0.62,
-    gearDown: false, crashed: false, landed: false, crashReason: '',
+    gearDown: false, flaps: false, speedbrake: false,
+    fuel: 100, lowFuelWarned: false,
+    crashed: false, landed: false, crashReason: '',
     propAngle: 0,
   };
 
@@ -22,16 +24,26 @@ function makePlane(world) {
     // Pitch: stick back (input.pitch > 0) climbs.
     const targetPitch = clamp(input.pitch, -1, 1) * 0.38;
     plane.pitch = lerp(plane.pitch, targetPitch, 1 - Math.pow(0.004, dt));
-    // Throttle 0..1, speed chases it with drag.
+    // Throttle 0..1, speed chases it with drag. Flaps cost 10 kt of speed
+    // but lower the stall; the speedbrake sheds 25 kt while held.
     plane.throttle = clamp(plane.throttle + input.throttle * dt * 0.5, 0, 1);
-    const targetSpeed = 28 + plane.throttle * 62;
+    let targetSpeed = 28 + plane.throttle * 62;
+    if (plane.flaps) targetSpeed -= 10;
+    if (plane.speedbrake) targetSpeed -= 25;
+    // Out of fuel the engine idles: the plane sinks and must be landed.
+    if (plane.fuel <= 0) targetSpeed = Math.min(targetSpeed, 26);
     plane.speed = lerp(plane.speed, targetSpeed, 1 - Math.pow(0.35, dt));
+    // Fuel burns with throttle: a full tank lasts ~6 minutes at cruise,
+    // a full route takes ~3.5, so fuel is a decision, not a timer trap.
+    plane.fuel = Math.max(0, plane.fuel - dt * (0.10 + plane.throttle * 0.20));
     // Move along the heading, climbing with pitch; a slow plane sinks.
+    // The wind pushes the airframe sideways (from the west, 8 kt).
     const fx = Math.sin(plane.yaw), fz = -Math.cos(plane.yaw);
     const climb = Math.sin(plane.pitch) * plane.speed;
-    const sink = plane.speed < 34 ? (34 - plane.speed) * 0.55 : 0;
-    plane.x += fx * Math.cos(plane.pitch) * plane.speed * dt;
-    plane.z += fz * Math.cos(plane.pitch) * plane.speed * dt;
+    const stall = plane.flaps ? 28 : 34;
+    const sink = plane.speed < stall ? (stall - plane.speed) * 0.55 : 0;
+    plane.x += fx * Math.cos(plane.pitch) * plane.speed * dt + WORLD.wind.x * dt;
+    plane.z += fz * Math.cos(plane.pitch) * plane.speed * dt + WORLD.wind.z * dt;
     plane.y += (climb - sink) * dt;
     plane.propAngle += dt * (6 + plane.throttle * 26);
     // Ground / sea contact.
@@ -41,10 +53,11 @@ function makePlane(world) {
     const overRunway = Math.abs(plane.x - rw.x) < rw.wid / 2 + 90 &&
       Math.abs(plane.z - rw.z) < rw.len / 2 + 100;
     if (plane.y <= g + 2.2) {
+      const landSpeed = plane.flaps ? 58 : 52;
       if (overRunway && g < 6 && Math.abs(plane.roll) < 0.4 &&
-          Math.abs(plane.pitch) < 0.3 && plane.speed < 52 && plane.speed > 24) {
-        plane.landed = true;
-        plane.y = g + 2.2;
+          Math.abs(plane.pitch) < 0.3 && plane.speed < landSpeed && plane.speed > 24) {
+        if (!plane.gearDown) { plane.crashed = true; plane.crashReason = 'gear'; }
+        else { plane.landed = true; plane.y = g + 2.2; }
       } else if (g > 1.5) {
         plane.crashed = true; plane.crashReason = 'terrain';
       } else {
@@ -58,7 +71,9 @@ function makePlane(world) {
     plane.x = S.x; plane.y = S.y; plane.z = S.z;
     plane.yaw = S.yaw; plane.pitch = 0; plane.roll = 0;
     plane.speed = S.speed; plane.throttle = 0.62;
-    plane.gearDown = false; plane.crashed = false; plane.landed = false; plane.crashReason = '';
+    plane.gearDown = false; plane.flaps = false; plane.speedbrake = false;
+    plane.fuel = 100; plane.lowFuelWarned = false;
+    plane.crashed = false; plane.landed = false; plane.crashReason = '';
   };
 
   // Forward vector of the plane (world space).
@@ -113,11 +128,16 @@ function drawChasePlane(ctx, plane, w, h, time, cyFrac, scaleMul) {
   ctx.strokeStyle = '#8a7a5c'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(-20, 4); ctx.lineTo(-120, 40); ctx.moveTo(20, 4); ctx.lineTo(120, 40); ctx.stroke();
   // Fuselage: warm cream with a teal cheatline and orange nose.
-  const body = ctx.createLinearGradient(0, -110, 0, 60);
-  body.addColorStop(0, '#fbf3dd');
-  body.addColorStop(0.6, '#f4ead2');
-  body.addColorStop(1, '#e8d5ae');
-  ctx.fillStyle = body;
+  // The body gradient lives in fixed local coordinates, so one cached
+  // gradient serves every frame (no per-frame createLinearGradient).
+  if (!drawChasePlane._bodyGrad) {
+    const body = ctx.createLinearGradient(0, -110, 0, 60);
+    body.addColorStop(0, '#fbf3dd');
+    body.addColorStop(0.6, '#f4ead2');
+    body.addColorStop(1, '#e8d5ae');
+    drawChasePlane._bodyGrad = body;
+  }
+  ctx.fillStyle = drawChasePlane._bodyGrad;
   ctx.beginPath();
   ctx.moveTo(0, -118);
   ctx.bezierCurveTo(20, -100, 26, -60, 24, -10);

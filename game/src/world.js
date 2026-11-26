@@ -23,6 +23,9 @@ const WORLD = {
   ],
   start: { x: 0, y: 200, z: 2500, yaw: 0, speed: 55 },
   lighthouse: { x: -420, z: 2450 },
+  // Wind: from the west (270 deg) at 8 kt — pushes the plane east, drifts
+  // the clouds, and shows on the HUD wind chip. x/z are m/s in world space.
+  wind: { fromDeg: 270, speedKt: 8, x: 4.115, z: 0 },
 };
 
 function buildWorld() {
@@ -150,9 +153,93 @@ function buildWorld() {
     });
   }
 
+  // ---- ground decals: fields, a coastal road and a river ----
+  // Flat quads laid on the terrain (height + 0.8) so the islands read as
+  // farmland, roads and water, not bare heightfield. All seeded, fixed.
+  const decals = [];
+  const fieldColors = ['#c9a86a', '#7da05c', '#8a9a52', '#b59a6a', '#6f9a4e', '#d0b578'];
+  function addField(cx, cz, w, d, rot) {
+    const pts = [];
+    for (const [lx, lz] of [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]]) {
+      const c = Math.cos(rot), s = Math.sin(rot);
+      const x = cx + lx * c - lz * s, z = cz + lx * s + lz * c;
+      pts.push([x, groundHeight(x, z) + 0.8, z]);
+    }
+    if (pts.some((p) => p[1] < 3 || p[1] > 130)) return;
+    decals.push({ pts, fill: fieldColors[(rand() * fieldColors.length) | 0] });
+  }
+  // Farm patches on the west island lowlands and the north island apron.
+  for (let n = 0; n < 26; n++) {
+    const cx = -2600 + rand() * 2400, cz = -800 + rand() * 3400;
+    addField(cx, cz, 120 + rand() * 220, 90 + rand() * 180, rand() * Math.PI);
+  }
+  for (let n = 0; n < 10; n++) {
+    const cx = -200 + rand() * 1500, cz = -4400 + rand() * 1100;
+    addField(cx, cz, 110 + rand() * 180, 80 + rand() * 150, rand() * Math.PI);
+  }
+  // Coastal road: a chain of quads hugging the west coast, south to north.
+  const roadPts = [];
+  for (let z = 2800; z >= -1600; z -= 220) {
+    roadPts.push([-560 + Math.sin(z * 0.0009) * 260, z]);
+  }
+  for (let i = 0; i < roadPts.length - 1; i++) {
+    const [x0, z0] = roadPts[i], [x1, z1] = roadPts[i + 1];
+    const dx = x1 - x0, dz = z1 - z0, len = Math.hypot(dx, dz) || 1;
+    const px = (-dz / len) * 7, pz = (dx / len) * 7;
+    decals.push({
+      pts: [
+        [x0 - px, groundHeight(x0 - px, z0 - pz) + 0.8, z0 - pz],
+        [x0 + px, groundHeight(x0 + px, z0 + pz) + 0.8, z0 + pz],
+        [x1 + px, groundHeight(x1 + px, z1 + pz) + 0.8, z1 + pz],
+        [x1 - px, groundHeight(x1 - px, z1 - pz) + 0.8, z1 - pz],
+      ],
+      fill: '#5c5148',
+    });
+  }
+  // River: a blue ribbon winding down the west island into the strait.
+  const riverPts = [];
+  for (let t = 0; t <= 1.0001; t += 0.1) {
+    riverPts.push([-1900 + t * 1150 + Math.sin(t * 9) * 130, 1500 - t * 1900]);
+  }
+  for (let i = 0; i < riverPts.length - 1; i++) {
+    const [x0, z0] = riverPts[i], [x1, z1] = riverPts[i + 1];
+    const dx = x1 - x0, dz = z1 - z0, len = Math.hypot(dx, dz) || 1;
+    const px = (-dz / len) * 16, pz = (dx / len) * 16;
+    const p = (x, z) => [x, Math.max(groundHeight(x, z), 2.5) + 0.6, z];
+    decals.push({ pts: [p(x0 - px, z0 - pz), p(x0 + px, z0 + pz), p(x1 + px, z1 + pz), p(x1 - px, z1 - pz)], fill: '#2e7fa8' });
+  }
+
+  // ---- per-frame scratch: flat projection arrays, zero allocation ----
+  // Terrain vertices project into these typed arrays (x, y, depth, scale
+  // per vertex); buildings, rings and decals get their own scratch below.
+  const NV = (NX + 1) * (NZ + 1);
+  const projX = new Float32Array(NV), projY = new Float32Array(NV);
+  const projD = new Float32Array(NV), projS = new Float32Array(NV);
+  const projOk = new Uint8Array(NV);
+  const bProj = new Float32Array(buildings.length * 8 * 4);
+  const bOk = new Uint8Array(buildings.length * 8);
+  const ringProj = new Float32Array(6 * 29 * 4);
+  const ringOk = new Uint8Array(6 * 29);
+  const decalProj = new Float32Array(Math.max(1, decals.length) * 4 * 4);
+  const decalOk = new Uint8Array(Math.max(1, decals.length) * 4);
+  // Pooled draw items, one object per quad/building/decal, reused every
+  // frame: {d, kind, a, b, c, e, fill} — kind 0 = terrain quad (a..e are
+  // vertex indices), 1 = building (a = building index), 2 = decal (a = decal index).
+  const itemPool = [];
+  for (let i = 0; i < quads.length; i++) itemPool.push({ d: 0, kind: 0, a: 0, b: 0, c: 0, e: 0, fill: '' });
+  for (let i = 0; i < buildings.length; i++) itemPool.push({ d: 0, kind: 1, a: 0, b: 0, c: 0, e: 0, fill: '' });
+  for (let i = 0; i < decals.length; i++) itemPool.push({ d: 0, kind: 2, a: 0, b: 0, c: 0, e: 0, fill: '' });
+  const items = itemPool.slice();
+  // drawOrder: indices into items, sorted far-to-near each frame. The pool
+  // array itself is never truncated or re-sorted, so its objects survive.
+  const drawOrder = new Int32Array(items.length);
+
   return {
-    groundHeight, verts, NX, NZ, quads, buildings, clouds,
+    groundHeight, verts, NX, NZ, quads, buildings, clouds, decals,
     sunDir: SUN, rings: WORLD.rings, runway: WORLD.runway, lighthouse: WORLD.lighthouse,
+    wind: WORLD.wind,
+    projX, projY, projD, projS, projOk, bProj, bOk, ringProj, ringOk, decalProj, decalOk,
+    itemPool, items, drawOrder, nItems: 0,
   };
 }
 
@@ -166,38 +253,181 @@ function drawPoly(ctx, pts, fill) {
   ctx.fill();
 }
 
-// Project the terrain's shared vertices once per frame into a cache.
-function projectTerrain(world, cam, cache) {
+// Project the terrain's shared vertices once per frame into flat typed
+// arrays — no object per vertex, no allocation at all.
+const _tmpPt = { x: 0, y: 0, d: 0, s: 0 };
+function projectTerrain(world, cam) {
   const v = world.verts, n = v.length / 3;
+  const px = world.projX, py = world.projY, pd = world.projD, ps = world.projS, ok = world.projOk;
   for (let i = 0; i < n; i++) {
-    cache[i] = cam.project(v[i * 3], v[i * 3 + 1], v[i * 3 + 2]);
+    if (cam.projectInto(v[i * 3], v[i * 3 + 1], v[i * 3 + 2], _tmpPt)) {
+      px[i] = _tmpPt.x; py[i] = _tmpPt.y; pd[i] = _tmpPt.d; ps[i] = _tmpPt.s; ok[i] = 1;
+    } else ok[i] = 0;
   }
 }
 
-function drawTerrain(world, cam, cache, items) {
+// Fill world.items[0..n) with the visible terrain quads, buildings and
+// decals for this frame (pooled objects, no allocation), sorted far-to-near
+// by the caller. Returns the count.
+function collectDrawItems(world, cam) {
   const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
-  for (const q of world.quads) {
+  const px = world.projX, py = world.projY, pd = world.projD, ok = world.projOk;
+  const items = world.items;
+  let n = 0;
+  for (let qi = 0; qi < world.quads.length; qi++) {
+    const q = world.quads[qi];
     const dx = q.cx - cam.x, dz = q.cz - cam.z;
     const dist2 = dx * dx + dz * dz;
     if (dist2 > 2600 * 2600) continue;
     if (dx * fx + dz * fz < -200) continue; // behind the camera
-    const p0 = cache[q.v[0]], p1 = cache[q.v[1]], p2 = cache[q.v[2]], p3 = cache[q.v[3]];
-    if (!p0 || !p1 || !p2 || !p3) continue;
-    items.push({ d: (p0.d + p1.d + p2.d + p3.d) * 0.25, pts: [p0, p1, p2, p3], fill: q.color });
+    const v0 = q.v[0], v1 = q.v[1], v2 = q.v[2], v3 = q.v[3];
+    if (!ok[v0] || !ok[v1] || !ok[v2] || !ok[v3]) continue;
+    const it = items[n++];
+    it.d = (pd[v0] + pd[v1] + pd[v2] + pd[v3]) * 0.25;
+    it.kind = 0; it.a = v0; it.b = v1; it.c = v2; it.e = v3; it.fill = q.color;
+  }
+  // Buildings: project 8 corners into scratch, keep the item for the sort.
+  for (let bi = 0; bi < world.buildings.length; bi++) {
+    const b = world.buildings[bi];
+    const dx = b.x - cam.x, dz = b.z - cam.z;
+    if (dx * dx + dz * dz > 3000 * 3000) continue;
+    const hw = b.w / 2, hd = b.d / 2, top = b.y + b.h;
+    const baseY = b.y - 15;
+    const corners = [
+      [b.x - hw, baseY, b.z - hd], [b.x + hw, baseY, b.z - hd],
+      [b.x + hw, baseY, b.z + hd], [b.x - hw, baseY, b.z + hd],
+      [b.x - hw, top, b.z - hd], [b.x + hw, top, b.z - hd],
+      [b.x + hw, top, b.z + hd], [b.x - hw, top, b.z + hd],
+    ];
+    let any = false, depth = 0;
+    for (let k = 0; k < 8; k++) {
+      const o = bi * 8 + k;
+      if (cam.projectInto(corners[k][0], corners[k][1], corners[k][2], _tmpPt)) {
+        world.bProj[o * 4] = _tmpPt.x; world.bProj[o * 4 + 1] = _tmpPt.y;
+        world.bProj[o * 4 + 2] = _tmpPt.d; world.bProj[o * 4 + 3] = _tmpPt.s;
+        world.bOk[o] = 1; any = true; depth += _tmpPt.d;
+      } else world.bOk[o] = 0;
+    }
+    if (!any) continue;
+    const it = items[n++];
+    it.d = depth / 8; it.kind = 1; it.a = bi;
+  }
+  // Decals (fields / road / river): project 4 corners into scratch.
+  for (let di = 0; di < world.decals.length; di++) {
+    const dc = world.decals[di];
+    const cx = (dc.pts[0][0] + dc.pts[2][0]) * 0.5, cz = (dc.pts[0][2] + dc.pts[2][2]) * 0.5;
+    const dx = cx - cam.x, dz = cz - cam.z;
+    if (dx * dx + dz * dz > 2600 * 2600) continue;
+    if (dx * fx + dz * fz < -200) continue;
+    let any = false, depth = 0;
+    for (let k = 0; k < 4; k++) {
+      const o = di * 4 + k;
+      if (cam.projectInto(dc.pts[k][0], dc.pts[k][1], dc.pts[k][2], _tmpPt)) {
+        world.decalProj[o * 4] = _tmpPt.x; world.decalProj[o * 4 + 1] = _tmpPt.y;
+        world.decalProj[o * 4 + 2] = _tmpPt.d; world.decalProj[o * 4 + 3] = _tmpPt.s;
+        world.decalOk[o] = 1; any = true; depth += _tmpPt.d;
+      } else world.decalOk[o] = 0;
+    }
+    if (!any) continue;
+    const it = items[n++];
+    it.d = depth / 4; it.kind = 2; it.a = di;
+  }
+  world.nItems = n;
+  // Index order for the painter's sort (the pool itself stays untouched).
+  const order = world.drawOrder;
+  for (let i = 0; i < n; i++) order[i] = i;
+  return n;
+}
+
+// Draw one pooled item (kind 0 = terrain quad from flat arrays,
+// 1 = building from bProj scratch, 2 = decal from decalProj scratch).
+function drawItem(ctx, world, cam, it) {
+  if (it.kind === 0) {
+    const px = world.projX, py = world.projY;
+    ctx.beginPath();
+    ctx.moveTo(px[it.a], py[it.a]);
+    ctx.lineTo(px[it.b], py[it.b]);
+    ctx.lineTo(px[it.c], py[it.c]);
+    ctx.lineTo(px[it.e], py[it.e]);
+    ctx.closePath();
+    ctx.fillStyle = it.fill;
+    ctx.fill();
+  } else if (it.kind === 2) {
+    const dp = world.decalProj, ok = world.decalOk, o = it.a * 4;
+    if (!ok[o] || !ok[o + 1] || !ok[o + 2] || !ok[o + 3]) return;
+    ctx.beginPath();
+    ctx.moveTo(dp[o * 4], dp[o * 4 + 1]);
+    ctx.lineTo(dp[(o + 1) * 4], dp[(o + 1) * 4 + 1]);
+    ctx.lineTo(dp[(o + 2) * 4], dp[(o + 2) * 4 + 1]);
+    ctx.lineTo(dp[(o + 3) * 4], dp[(o + 3) * 4 + 1]);
+    ctx.closePath();
+    ctx.fillStyle = world.decals[it.a].fill;
+    ctx.fill();
+  } else {
+    drawBuildingItem(ctx, world, cam, it.a);
   }
 }
 
+// Flat quad path from a scratch projection array (no point objects).
+function drawQuadFlat(ctx, arr, base, i0, i1, i2, i3, fill) {
+  ctx.beginPath();
+  ctx.moveTo(arr[(base + i0) * 4], arr[(base + i0) * 4 + 1]);
+  ctx.lineTo(arr[(base + i1) * 4], arr[(base + i1) * 4 + 1]);
+  ctx.lineTo(arr[(base + i2) * 4], arr[(base + i2) * 4 + 1]);
+  ctx.lineTo(arr[(base + i3) * 4], arr[(base + i3) * 4 + 1]);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+function drawBuildingItem(ctx, world, cam, bi) {
+  const b = world.buildings[bi];
+  const bp = world.bProj, ok = world.bOk, base = bi * 8;
+  for (let k = 0; k < 8; k++) if (!ok[base + k]) return;
+  const X = (k) => bp[(base + k) * 4], Y = (k) => bp[(base + k) * 4 + 1];
+  // Roof.
+  drawQuadFlat(ctx, bp, base, 4, 5, 6, 7, b.top);
+  // Two camera-facing walls: pick by which side the camera is on.
+  const faces = [];
+  if (cam.z > b.z + b.d / 2) faces.push([2, 3, 7, 6]); // south wall
+  else if (cam.z < b.z - b.d / 2) faces.push([0, 1, 5, 4]); // north wall
+  if (cam.x > b.x + b.w / 2) faces.push([1, 2, 6, 5]); // east wall
+  else if (cam.x < b.x - b.w / 2) faces.push([3, 0, 4, 7]); // west wall
+  for (const f of faces) drawQuadFlat(ctx, bp, base, f[0], f[1], f[2], f[3], b.color);
+  // Lit windows on the walls: a few warm dots.
+  ctx.fillStyle = '#ffd98a';
+  for (const f of faces) {
+    const rows = Math.max(1, Math.min(4, b.floors));
+    for (let rI = 0; rI < rows; rI++) {
+      for (let cI = 0; cI < 3; cI++) {
+        const u = 0.2 + cI * 0.3, v = 0.25 + rI * (0.6 / rows);
+        const ix = X(f[0]) * (1 - u) * (1 - v) + X(f[1]) * u * (1 - v) + X(f[2]) * u * v + X(f[3]) * (1 - u) * v;
+        const iy = Y(f[0]) * (1 - u) * (1 - v) + Y(f[1]) * u * (1 - v) + Y(f[2]) * u * v + Y(f[3]) * (1 - u) * v;
+        if (((rI * 3 + cI + b.x) % 3) !== 0) continue;
+        ctx.fillRect(ix - 1.5, iy - 1.5, 3, 3);
+      }
+    }
+  }
+}
+
+let _seaGrad = null, _seaGradHy = -1, _seaGradH = 0;
 function drawSea(ctx, world, cam, time) {
   const w = cam.w, h = cam.h;
   // Horizon line: project a far sea point straight ahead.
   const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
   const hp = cam.project(cam.x + fx * 6000, 0, cam.z + fz * 6000);
   const hy = hp ? hp.y : h * 0.52;
-  const g = ctx.createLinearGradient(0, hy, 0, h);
-  g.addColorStop(0, '#c96b2e');
-  g.addColorStop(0.25, '#14505e');
-  g.addColorStop(1, '#082e3c');
-  ctx.fillStyle = g;
+  // The sea gradient depends only on the (rounded) horizon line: rebuild
+  // it only when the horizon moved, not every frame.
+  const hyR = Math.round(hy / 3) * 3;
+  if (!_seaGrad || _seaGradHy !== hyR || _seaGradH !== h) {
+    const g = ctx.createLinearGradient(0, hyR, 0, h);
+    g.addColorStop(0, '#c96b2e');
+    g.addColorStop(0.25, '#14505e');
+    g.addColorStop(1, '#082e3c');
+    _seaGrad = g; _seaGradHy = hyR; _seaGradH = h;
+  }
+  ctx.fillStyle = _seaGrad;
   ctx.fillRect(0, hy, w, h - hy);
   // Gentle wave strokes so the water is not a flat void.
   ctx.save();
@@ -233,34 +463,54 @@ function drawSea(ctx, world, cam, time) {
   return hy;
 }
 
+// Sky gradient is static per canvas height: build once, reuse every frame.
+// The sun's glow is pre-rendered once into a small offscreen sprite.
+let _skyGrad = null, _skyGradH = 0, _sunSprite = null;
+function skyGradient(ctx, h) {
+  if (!_skyGrad || _skyGradH !== h) {
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#141c3d');
+    g.addColorStop(0.42, '#4a2c55');
+    g.addColorStop(0.62, '#a34d3a');
+    g.addColorStop(0.74, '#ff9a3c');
+    g.addColorStop(1, '#2a1a2e');
+    _skyGrad = g; _skyGradH = h;
+  }
+  return _skyGrad;
+}
+function sunSprite() {
+  if (_sunSprite) return _sunSprite;
+  const c = document.createElement('canvas');
+  c.width = 520; c.height = 520;
+  const g = c.getContext('2d');
+  const glow = g.createRadialGradient(260, 260, 4, 260, 260, 260);
+  glow.addColorStop(0, 'rgba(255,214,140,0.95)');
+  glow.addColorStop(0.25, 'rgba(255,150,70,0.55)');
+  glow.addColorStop(1, 'rgba(255,120,40,0)');
+  g.fillStyle = glow;
+  g.fillRect(0, 0, 520, 520);
+  g.fillStyle = '#fff3cf';
+  g.beginPath(); g.arc(260, 260, 34, 0, Math.PI * 2); g.fill();
+  _sunSprite = c;
+  return c;
+}
+
 function drawSky(ctx, world, cam, time) {
   const w = cam.w, h = cam.h;
-  const g = ctx.createLinearGradient(0, 0, 0, h);
-  g.addColorStop(0, '#141c3d');
-  g.addColorStop(0.42, '#4a2c55');
-  g.addColorStop(0.62, '#a34d3a');
-  g.addColorStop(0.74, '#ff9a3c');
-  g.addColorStop(1, '#2a1a2e');
-  ctx.fillStyle = g;
+  ctx.fillStyle = skyGradient(ctx, h);
   ctx.fillRect(0, 0, w, h);
   // Sun: low ahead-left on the northbound route.
   const sd = world.sunDir;
   const sp = cam.project(cam.x + sd.x * 8000, 500, cam.z + sd.z * 8000);
   if (sp && sp.x > -300 && sp.x < w + 300 && sp.y > -200 && sp.y < h * 0.8) {
-    const glow = ctx.createRadialGradient(sp.x, sp.y, 4, sp.x, sp.y, 260);
-    glow.addColorStop(0, 'rgba(255,214,140,0.95)');
-    glow.addColorStop(0.25, 'rgba(255,150,70,0.55)');
-    glow.addColorStop(1, 'rgba(255,120,40,0)');
-    ctx.fillStyle = glow;
-    ctx.fillRect(sp.x - 260, sp.y - 260, 520, 520);
-    ctx.fillStyle = '#fff3cf';
-    ctx.beginPath(); ctx.arc(sp.x, sp.y, 34, 0, Math.PI * 2); ctx.fill();
+    ctx.drawImage(sunSprite(), sp.x - 260, sp.y - 260);
   }
 }
 
-function drawClouds(ctx, world, cam) {
+function drawClouds(ctx, world, cam, time) {
+  const drift = WORLD.wind.x * time * 0.8; // clouds ride the wind east
   for (const cl of world.clouds) {
-    const p = cam.project(cl.x, cl.y, cl.z);
+    const p = cam.project(cl.x + drift, cl.y, cl.z);
     if (!p || p.d > 9000) continue;
     const s = cl.s * p.s * 0.5;
     ctx.fillStyle = `rgba(255,214,190,${cl.a})`;
@@ -323,55 +573,6 @@ function drawRunway(ctx, world, cam) {
   }
 }
 
-function drawBuildings(ctx, world, cam, items) {
-  for (const b of world.buildings) {
-    const dx = b.x - cam.x, dz = b.z - cam.z;
-    if (dx * dx + dz * dz > 3000 * 3000) continue;
-    const hw = b.w / 2, hd = b.d / 2, top = b.y + b.h;
-    // Sink the base 15 m into the ground: the terrain grid is coarse, so a
-    // building's exact base height can sit above the rendered quads and
-    // read as floating. Burying the base hides the gap.
-    const baseY = b.y - 15;
-    const c = [
-      cam.project(b.x - hw, baseY, b.z - hd), cam.project(b.x + hw, baseY, b.z - hd),
-      cam.project(b.x + hw, baseY, b.z + hd), cam.project(b.x - hw, baseY, b.z + hd),
-      cam.project(b.x - hw, top, b.z - hd), cam.project(b.x + hw, top, b.z - hd),
-      cam.project(b.x + hw, top, b.z + hd), cam.project(b.x - hw, top, b.z + hd),
-    ];
-    if (c.some(p => !p)) continue;
-    const depth = (c[0].d + c[6].d) * 0.5;
-    items.push({ d: depth, draw: () => {
-      // Roof.
-      drawPoly(ctx, [c[4], c[5], c[6], c[7]], b.top);
-      // Two camera-facing walls: pick by which side the camera is on.
-      const faces = [];
-      if (cam.z > b.z + hd) faces.push([c[2], c[3], c[7], c[6]]); // south wall
-      else if (cam.z < b.z - hd) faces.push([c[0], c[1], c[5], c[4]]); // north wall
-      if (cam.x > b.x + hw) faces.push([c[1], c[2], c[6], c[5]]); // east wall
-      else if (cam.x < b.x - hw) faces.push([c[3], c[0], c[4], c[7]]); // west wall
-      for (const f of faces) drawPoly(ctx, f, b.color);
-      // Lit windows on the walls: a few warm dots.
-      ctx.fillStyle = '#ffd98a';
-      for (const f of faces) {
-        const rows = Math.max(1, Math.min(4, b.floors));
-        for (let rI = 0; rI < rows; rI++) {
-          for (let cI = 0; cI < 3; cI++) {
-            const u = 0.2 + cI * 0.3, v = 0.25 + rI * (0.6 / rows);
-            const px = f[0].x + (f[1].x - f[0].x) * u + (f[3].x - f[0].x) * v - (f[1].x - f[0].x) * v * 0;
-            const py = f[0].y + (f[1].y - f[0].y) * u + (f[3].y - f[0].y) * v;
-            // Interpolate properly across the quad.
-            const ix = f[0].x * (1 - u) * (1 - v) + f[1].x * u * (1 - v) + f[2].x * u * v + f[3].x * (1 - u) * v;
-            const iy = f[0].y * (1 - u) * (1 - v) + f[1].y * u * (1 - v) + f[2].y * u * v + f[3].y * (1 - u) * v;
-            void px; void py;
-            if (((rI * 3 + cI + b.x) % 3) !== 0) continue;
-            ctx.fillRect(ix - 1.5, iy - 1.5, 3, 3);
-          }
-        }
-      }
-    }});
-  }
-}
-
 function drawLighthouse(ctx, world, cam, time) {
   const L = world.lighthouse || WORLD.lighthouse;
   const gy = world.groundHeight(L.x, L.z);
@@ -411,38 +612,45 @@ function drawRings(ctx, world, cam, passed, showLabels) {
     if (!c) continue;
     const done = passed[i];
     const col = done ? '#39d353' : '#ffb020';
-    // Sample the circle (ring faces south, toward the incoming plane).
-    const pts = [];
+    // Sample the circle into the ring scratch (ring faces south, toward
+    // the incoming plane) — no per-point objects.
+    const base = i * 29;
+    let any = false;
     for (let k = 0; k <= 28; k++) {
       const a = (k / 28) * Math.PI * 2;
-      const p = cam.project(R.x + Math.cos(a) * R.r, R.y + Math.sin(a) * R.r, R.z);
-      pts.push(p);
+      const o = base + k;
+      if (cam.projectInto(R.x + Math.cos(a) * R.r, R.y + Math.sin(a) * R.r, R.z, _tmpPt)) {
+        world.ringProj[o * 4] = _tmpPt.x; world.ringProj[o * 4 + 1] = _tmpPt.y;
+        world.ringProj[o * 4 + 2] = _tmpPt.d; world.ringProj[o * 4 + 3] = _tmpPt.s;
+        world.ringOk[o] = 1; any = true;
+      } else world.ringOk[o] = 0;
     }
-    if (pts.some(p => !p)) continue;
+    if (!any) continue;
+    const rp = world.ringProj;
+    const trace = (width, alpha) => {
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = width;
+      ctx.beginPath();
+      ctx.moveTo(rp[base * 4], rp[base * 4 + 1]);
+      for (let k = 1; k <= 28; k++) {
+        const o = base + k;
+        if (world.ringOk[o]) ctx.lineTo(rp[o * 4], rp[o * 4 + 1]);
+      }
+      ctx.closePath(); ctx.stroke();
+    };
     const lw = clamp(260 / c.d, 1.5, 7);
     ctx.save();
     ctx.lineJoin = 'round';
     if (done) {
       // Cleared rings fade to a thin green trace so they never dominate.
-      ctx.globalAlpha = 0.28;
-      ctx.strokeStyle = col;
-      ctx.lineWidth = Math.max(1, lw * 0.7);
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (const p of pts) ctx.lineTo(p.x, p.y);
-      ctx.closePath(); ctx.stroke();
+      trace(Math.max(1, lw * 0.7), 0.28);
       ctx.restore();
       continue;
     }
-    for (const [width, alpha] of [[lw * 3.2, 0.16], [lw * 1.8, 0.35], [lw, 0.95]]) {
-      ctx.strokeStyle = col;
-      ctx.globalAlpha = alpha;
-      ctx.lineWidth = width;
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (const p of pts) ctx.lineTo(p.x, p.y);
-      ctx.closePath(); ctx.stroke();
-    }
+    trace(lw * 3.2, 0.16);
+    trace(lw * 1.8, 0.35);
+    trace(lw, 0.95);
     ctx.restore();
     // Label only the next ring, below it so it never sits on the plane,
     // and only once it is close enough to loom large.
@@ -456,5 +664,31 @@ function drawRings(ctx, world, cam, passed, showLabels) {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(label, c.x, c.y + R.r * c.s + 16);
     }
+  }
+}
+
+// PAPI approach lights beside the south threshold: four lamps whose colour
+// reads the glidepath — white = above it, red = below it (2 white + 2 red
+// is on the 3-degree slope). A real landing aid, not decoration.
+function drawPapi(ctx, world, cam, plane) {
+  const rw = world.runway || WORLD.runway;
+  const hl = rw.len / 2;
+  const tx = rw.x - rw.wid / 2 - 26, tz = rw.z + hl - 30;
+  const dz = plane.z - tz, dx = plane.x - tx;
+  const dist = Math.hypot(dx, dz);
+  if (dist > 2600) return;
+  const ideal = dist * Math.tan(3 * Math.PI / 180);
+  const err = plane.y - 2 - ideal; // height above the 3-degree slope
+  // 4 white if >+25 m high, 3W1R >+10, 2W2R within +/-10, 1W3R <-10, 4 red <-25.
+  const whites = err > 25 ? 4 : err > 10 ? 3 : err > -10 ? 2 : err > -25 ? 1 : 0;
+  for (let k = 0; k < 4; k++) {
+    const p = cam.project(tx, 3, tz + k * 9);
+    if (!p) continue;
+    const r = clamp(120 / p.d, 1.5, 5);
+    const white = k < whites;
+    ctx.fillStyle = white ? '#ffffff' : '#ff2e2e';
+    ctx.beginPath(); ctx.arc(p.x, p.y, r + 1.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = white ? '#fff8e0' : '#ff6a5c';
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
   }
 }

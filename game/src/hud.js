@@ -17,9 +17,12 @@ function drawChip(ctx, x, y, label, value, unit, w) {
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 24px Arial, sans-serif';
   ctx.fillText(value, x + 10, y + 43);
+  // Measure the value in ITS OWN (24px) font: measuring after switching
+  // to the 12px unit font under-measures and the unit overlaps the value.
+  const valueW = ctx.measureText(value).width;
   ctx.fillStyle = '#c9d4e8';
   ctx.font = 'bold 12px Arial, sans-serif';
-  ctx.fillText(unit, x + 10 + ctx.measureText(value).width + 6, y + 43);
+  ctx.fillText(unit, x + 10 + valueW + 6, y + 43);
   ctx.restore();
 }
 
@@ -33,7 +36,7 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function drawHud(ctx, plane, score, ringsGot, ringsTotal, timeSec, objective) {
+function drawHud(ctx, plane, score, ringsGot, ringsTotal, timeSec, objective, nowSec) {
   const w = ctx.canvas.width;
   const altFt = Math.max(0, Math.round(plane.y * 3.281));
   const spdKt = Math.round(plane.speed * 1.944);
@@ -42,6 +45,23 @@ function drawHud(ctx, plane, score, ringsGot, ringsTotal, timeSec, objective) {
   drawChip(ctx, 172, 14, 'AIRSPEED', String(spdKt), 'KT', 148);
   drawChip(ctx, 328, 14, 'HEADING', String(hdg).padStart(3, '0'), '°', 128);
   drawChip(ctx, 464, 14, 'THROTTLE', Math.round(plane.throttle * 100) + '', '%', 128);
+  // Fuel chip with a burn bar: green > 50, amber 25-50, red + flashing below 25.
+  const fuel = Math.max(0, Math.round(plane.fuel));
+  const lowFuel = fuel < 25;
+  const flash = lowFuel && Math.floor(nowSec * 2) % 2 === 0;
+  drawChip(ctx, 608, 14, 'FUEL', String(fuel), '%', 128);
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.16)';
+  ctx.fillRect(618, 52, 108, 5);
+  ctx.fillStyle = flash ? '#ff2e2e' : fuel > 50 ? '#39d353' : fuel >= 25 ? '#ffb020' : '#ff2e2e';
+  ctx.fillRect(618, 52, 108 * fuel / 100, 5);
+  if (flash) {
+    ctx.strokeStyle = '#ff2e2e'; ctx.lineWidth = 2;
+    roundRect(ctx, 608, 14, 128, 52, 8); ctx.stroke();
+  }
+  ctx.restore();
+  // Wind chip: direction the wind blows FROM, plus its speed.
+  drawChip(ctx, 744, 14, 'WIND', String(WORLD.wind.fromDeg) + '°', WORLD.wind.speedKt + ' KT', 148);
   // Right side: rings + score + time.
   drawChip(ctx, w - 268, 14, 'RINGS', ringsGot + '/' + ringsTotal, '', 124);
   drawChip(ctx, w - 136, 14, 'SCORE', String(score), '', 120);
@@ -56,6 +76,15 @@ function drawHud(ctx, plane, score, ringsGot, ringsTotal, timeSec, objective) {
   ctx.textBaseline = 'middle';
   ctx.fillText(objective, w / 2, 91);
   ctx.restore();
+  // Low-fuel warning under the objective line.
+  if (lowFuel) {
+    ctx.save();
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = flash ? '#ff5a3c' : '#ffb020';
+    ctx.fillText('LOW FUEL — LAND AT THE RUNWAY SOON', w / 2, 122);
+    ctx.restore();
+  }
   // Timer, bottom-right.
   const mm = String(Math.floor(timeSec / 60)).padStart(2, '0');
   const ss = String(Math.floor(timeSec % 60)).padStart(2, '0');
@@ -68,16 +97,21 @@ function drawHud(ctx, plane, score, ringsGot, ringsTotal, timeSec, objective) {
 }
 
 // ---- lit instrument panel (bottom centre) ----
+// The amber panel glow depends only on the panel box: cache it per box.
+let _panelGlow = null, _panelGlowKey = '';
 function drawInstruments(ctx, plane, w, h, cockpit) {
   const pw = cockpit ? 560 : 420;
   const ph = cockpit ? 132 : 96;
   const px = (w - pw) / 2, py = h - ph - 12;
   ctx.save();
-  // Panel body: dark with a warm amber glow from within.
-  const glow = ctx.createRadialGradient(w / 2, py + ph / 2, 10, w / 2, py + ph / 2, pw * 0.6);
-  glow.addColorStop(0, 'rgba(255,170,80,0.20)');
-  glow.addColorStop(1, 'rgba(255,170,80,0)');
-  ctx.fillStyle = glow;
+  const glowKey = `${px},${py},${pw},${ph}`;
+  if (!_panelGlow || _panelGlowKey !== glowKey) {
+    const glow = ctx.createRadialGradient(w / 2, py + ph / 2, 10, w / 2, py + ph / 2, pw * 0.6);
+    glow.addColorStop(0, 'rgba(255,170,80,0.20)');
+    glow.addColorStop(1, 'rgba(255,170,80,0)');
+    _panelGlow = glow; _panelGlowKey = glowKey;
+  }
+  ctx.fillStyle = _panelGlow;
   ctx.fillRect(px - 40, py - 40, pw + 80, ph + 80);
   ctx.fillStyle = 'rgba(12,16,28,0.88)';
   roundRect(ctx, px, py, pw, ph, 12); ctx.fill();
@@ -94,11 +128,13 @@ function drawInstruments(ctx, plane, w, h, cockpit) {
   // Compass tape (right), leaving room for the GEAR / FULL lamps.
   const tx = px + 48 + r * 6 + 6, tw = pw - (48 + r * 6 + 6) - 46;
   drawCompass(ctx, tx, py + 14, tw, ph - 28, plane.yaw);
-  // Gear + flap lamps.
+  // Gear / flap / speedbrake / full-throttle lamps.
   ctx.font = 'bold 10px Arial, sans-serif';
   ctx.textAlign = 'center';
-  lamp(ctx, px + pw - 30, py + 16, plane.gearDown, 'GEAR');
-  lamp(ctx, px + pw - 30, py + 40, plane.throttle > 0.85, 'FULL');
+  lamp(ctx, px + pw - 30, py + 14, plane.gearDown, 'GEAR');
+  lamp(ctx, px + pw - 30, py + 34, plane.flaps, 'FLAP');
+  lamp(ctx, px + pw - 30, py + 54, plane.speedbrake, 'BRK');
+  lamp(ctx, px + pw - 30, py + 74, plane.throttle > 0.85, 'FULL');
   ctx.restore();
 }
 
@@ -220,11 +256,16 @@ function drawBanner(ctx, text, sub, w, h) {
 
 function drawTitle(ctx, w, h, time) {
   ctx.save();
-  const g = ctx.createLinearGradient(0, 0, 0, h);
-  g.addColorStop(0, 'rgba(10,12,30,0.25)');
-  g.addColorStop(0.55, 'rgba(10,12,30,0)');
-  g.addColorStop(1, 'rgba(10,12,30,0.55)');
-  ctx.fillStyle = g;
+  // Title shade is static per canvas size: cache the gradient.
+  const key = `${w}x${h}`;
+  if (drawTitle._gradKey !== key) {
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, 'rgba(10,12,30,0.25)');
+    g.addColorStop(0.55, 'rgba(10,12,30,0)');
+    g.addColorStop(1, 'rgba(10,12,30,0.55)');
+    drawTitle._grad = g; drawTitle._gradKey = key;
+  }
+  ctx.fillStyle = drawTitle._grad;
   ctx.fillRect(0, 0, w, h);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#ffd166';
@@ -248,7 +289,7 @@ function drawTitle(ctx, w, h, time) {
   ctx.globalAlpha = 1;
   ctx.font = '15px Arial, sans-serif';
   ctx.fillStyle = 'rgba(255,255,255,0.9)';
-  ctx.fillText('← → bank  •  ↑ ↓ pitch  •  SHIFT / CTRL throttle  •  MOUSE steer  •  C cockpit  •  R restart  •  P pause', w / 2, h * 0.80 + 34);
+  ctx.fillText('← → bank  •  ↑ ↓ pitch  •  SHIFT / CTRL throttle  •  MOUSE steer  •  G gear  •  F flaps  •  B brake  •  C cockpit  •  H help  •  R restart  •  P pause', w / 2, h * 0.80 + 34);
   ctx.restore();
 }
 
@@ -270,16 +311,27 @@ function drawEnd(ctx, w, h, kind, score, ringsGot, ringsTotal, timeSec) {
     ctx.fillText('CRASHED', w / 2, h * 0.34);
     ctx.fillStyle = '#ffffff';
     ctx.font = 'bold 24px Arial, sans-serif';
-    ctx.fillText(kind === 'sea' ? 'Kakatua-9 ditched into the strait.' : 'Kakatua-9 hit the hillside.', w / 2, h * 0.34 + 48);
+    ctx.fillText(kind === 'sea' ? 'Kakatua-9 ditched into the strait.'
+      : kind === 'gear' ? 'Kakatua-9 touched down gear-up — lower the gear (G) to land.'
+      : 'Kakatua-9 hit the hillside.', w / 2, h * 0.34 + 48);
   }
   const mm = String(Math.floor(timeSec / 60)).padStart(2, '0');
   const ss = String(Math.floor(timeSec % 60)).padStart(2, '0');
   ctx.font = 'bold 22px Arial, sans-serif';
   ctx.fillStyle = '#ffe1a8';
   ctx.fillText(`SCORE ${score}   •   RINGS ${ringsGot}/${ringsTotal}   •   TIME ${mm}:${ss}`, w / 2, h * 0.34 + 96);
+  if (kind === 'landed') {
+    // Itemised landing score: rings + landing bonus + time bonus.
+    const ringsPts = ringsGot * 100;
+    const timeBonus = Math.max(0, 300 - Math.floor(timeSec));
+    const landBonus = score - ringsPts - timeBonus;
+    ctx.font = 'bold 18px Arial, sans-serif';
+    ctx.fillStyle = '#c9d4e8';
+    ctx.fillText(`RINGS ${ringsGot} × 100 = ${ringsPts}   •   LANDING +${landBonus}   •   TIME BONUS +${timeBonus}`, w / 2, h * 0.34 + 128);
+  }
   ctx.font = 'bold 20px Arial, sans-serif';
   ctx.fillStyle = '#ffffff';
   ctx.globalAlpha = 0.65 + 0.35 * Math.sin(Date.now() / 300);
-  ctx.fillText('PRESS R TO FLY AGAIN', w / 2, h * 0.34 + 140);
+  ctx.fillText('PRESS R TO FLY AGAIN', w / 2, h * 0.34 + 168);
   ctx.restore();
 }

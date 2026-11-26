@@ -85,6 +85,26 @@ function makeCamera(fovDeg, width, height) {
     const s = cam.f / depth;
     return { x: cam.w * 0.5 + rx * s, y: cam.h * 0.5 - ry * s, d: depth, s };
   };
+  // projectInto: same math, writes into a reused {x,y,d,s} object instead of
+  // allocating one — the hot loop (terrain/buildings/rings) uses this so a
+  // frame allocates nothing. Returns false when the point is behind.
+  cam.projectInto = function (x, y, z, out) {
+    let dx = x - cam.x, dy = y - cam.y, dz = z - cam.z;
+    const cy = Math.cos(-cam.yaw), sy = Math.sin(-cam.yaw);
+    let rx = dx * cy - dz * sy;
+    let rz = dx * sy + dz * cy;
+    const cp = Math.cos(-cam.pitch), sp = Math.sin(-cam.pitch);
+    let ry = dy * cp - rz * sp;
+    rz = dy * sp + rz * cp;
+    const depth = -rz;
+    if (depth < 0.5) return false;
+    const s = cam.f / depth;
+    out.x = cam.w * 0.5 + rx * s;
+    out.y = cam.h * 0.5 - ry * s;
+    out.d = depth;
+    out.s = s;
+    return true;
+  };
   return cam;
 }
 
