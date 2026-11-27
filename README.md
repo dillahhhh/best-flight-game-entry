@@ -1,5 +1,11 @@
 # Ember Strait — Volcanic Archipelago Flight
 
+[![make.fun · best-flight-game-20261126-0057](https://make.fun/badge/best-flight-game-20261126-0057.svg)](https://make.fun/bounty/best-flight-game-20261126-0057?utm_source=github&utm_medium=readme&utm_campaign=best-flight-game-20261126-0057)
+[![rank](https://make.fun/badge/best-flight-game-20261126-0057/dillahhhh/best-flight-game-entry/rank.svg)](https://make.fun/bounty/best-flight-game-20261126-0057/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-flight-game-20261126-0057)
+[![reward](https://make.fun/badge/best-flight-game-20261126-0057/dillahhhh/best-flight-game-entry/reward.svg)](https://make.fun/bounty/best-flight-game-20261126-0057?utm_source=github&utm_medium=readme&utm_campaign=best-flight-game-20261126-0057)
+
+Built for [Make the best flight game](https://make.fun/bounty/best-flight-game-20261126-0057) on make.fun.
+
 Fly the Kestrel-9 floatplane across a living volcanic strait: 8 sorties in
 4 modes, ring trials, island landings and a night freight run. Fuel burns,
 wind bites, the volcano smokes.
