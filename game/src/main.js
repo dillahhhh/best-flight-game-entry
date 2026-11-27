@@ -1,422 +1,319 @@
-// SUNSET STRAIT — main.js
-// Game loop, input, cameras, states and the render pipeline.
-// States: title (autopilot attract mode) -> fly -> landed / crashed.
-// ?shot=chase|cockpit|rings|landing freezes a composed frame for screenshots.
-//
-// PERF (measured in headless Chrome, software rendering, 2026-11-26):
-//   - Hot loop allocates nothing per frame: terrain projects into flat
-//     typed arrays, draw items are pooled objects sorted by an index array,
-//     gradients are cached (sky, sea, sun sprite, panel glow, haze), and the
-//     canvas backing store is capped at 1920x1080.
-//   - 1280x720 steady state: JS render 2.3 ms avg / 3.0 ms p95; rAF frame
-//     17.6 ms avg / 33.3 ms p95 (vsync/scheduler-bound in headless).
-//   - 2560x1440 window: 24.5 fps (v1, uncapped canvas) -> 29.9 fps (v2,
-//     backing-store cap) in software rendering; on a real desktop with GPU
-//     compositing the 2.3 ms render is 60 fps.
-//   - Winnability proven by a headless Node sim of the real flight model:
-//     6 rings in 80.5 s, touchdown at 98.7 s, score 1302, 79% fuel left.
+// main.js — Ember Strait bootstrap and game loop.
+// Owns the renderer, the cameras (chase / cockpit / orbit), the state
+// machine (title -> flying -> paused / landed / crashed), the demo
+// autopilot, the ?shot= presets and the measurement hooks the
+// verification harness reads (window.__ember).
 
-(function () {
-  'use strict';
-  const canvas = document.getElementById('game');
-  const ctx = canvas.getContext('2d');
-  const params = new URLSearchParams(location.search);
-  const SHOT = params.get('shot');
-  const SHOT_TIME = 8.0; // frozen clock for screenshot frames
-  // Demo mode (?demo=1): the plane flies itself on the autopilot — thread
-  // the rings, configure for landing — so the game can be watched, and so
-  // the ring-pass popups can be seen live without touching the controls.
+import * as THREE from 'three';
+import { MISSIONS, newFlightState, stepFlight, autopilotInput, autopilotTarget } from './flight.js';
+import { terrainHeight, AIRFIELDS } from './terrain.js';
+import { buildWorld, applySkyPhase, buildRings, PHASE_ORDER } from './world.js';
+import { buildPlane, posePlane } from './plane.js';
+import { buildHud, updateHud, showScreen, hideScreen, titleScreenHtml } from './hud.js';
+import { createInput } from './input.js';
+import { createAudio } from './audio.js';
+import { getShot } from './shots.js';
 
-  const DEMO = params.get('demo') === '1';
+const params = new URLSearchParams(location.search);
+const SHOT = params.has('shot') ? Number(params.get('shot') || 1) : 0;
+const DEMO = params.has('demo');
+const SIM = params.has('sim');
+const SIM_MISSION = Number(params.get('mission') || 1);
 
-  // Perf probe: only when ?perf=1 — records rAF frame deltas + render cost
-  // into window.__perf (zero overhead otherwise). Used by the v2 perf harness.
-  const PERF = params.get('perf') === '1';
-  const perf = PERF ? { deltas: [], renders: [], errors: [] } : null;
-  if (PERF) {
-    window.__perf = perf;
-    window.__perfSummary = function () {
-      function stats(a) {
-        // Skip the first 30 samples: JIT warmup + first-frame shader/gradient
-        // setup, so the numbers describe steady-state flight.
-        const s = a.slice(30).sort((x, y) => x - y);
-        const avg = s.reduce((x, y) => x + y, 0) / Math.max(1, s.length);
-        return {
-          n: s.length,
-          avg: +avg.toFixed(2),
-          p95: +s[Math.min(s.length - 1, Math.floor(s.length * 0.95))].toFixed(2),
-          max: +s[s.length - 1].toFixed(2),
-          fps: +(1000 / Math.max(avg, 0.01)).toFixed(1),
-        };
-      }
-      return { frame: stats(perf.deltas), render: stats(perf.renders), errors: perf.errors };
-    };
-    window.addEventListener('error', (e) => perf.errors.push(String(e.message || e.error)));
-  }
+const canvasHost = document.getElementById('scene');
+const hudRoot = document.getElementById('hud');
+const dashEl = document.getElementById('cockpit-dash');
 
-  const world = buildWorld();
-  const plane = makePlane(world);
-  const cam = makeCamera(62, 1280, 720);
-  // No per-frame vertex cache object anymore: terrain projects into the
-  // world's flat typed arrays (see world.js projectTerrain).
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+canvasHost.appendChild(renderer.domElement);
 
-  let W = 1280, H = 720;
-  function resize() {
-    // Cap the backing store at 1920x1080: a bigger canvas only buys fill
-    // cost, and CSS upscales the rest. This is the anti-lag cap.
-    W = Math.min(window.innerWidth, 1920); H = Math.min(window.innerHeight, 1080);
-    canvas.width = W; canvas.height = H;
-    cam.resize(W, H);
-  }
-  window.addEventListener('resize', resize);
-  resize();
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.5, 12000);
+const world = buildWorld(scene);
+const plane = buildPlane();
+scene.add(plane);
 
-  // ---- game state ----
-  let state = 'title'; // title | fly | landed | crashed
-  let cockpit = false;
-  let paused = false;
-  let help = false;
-  let mouseSteer = false;
-  let score = 0, ringsGot = 0, timeSec = 0, endTimer = 0;
-  let banner = null, bannerUntil = 0;
-  const passed = [false, false, false, false, false, false];
-  const prevRingDist = new Float32Array(6);
-  const scorePopups = []; // {x,y,z,text,until} in world space, max a handful
+const hud = buildHud(hudRoot);
+const inputCtl = createInput();
+const audio = createAudio();
 
-  const keys = {};
-  const mouse = { x: 0, y: 0 };
-  window.addEventListener('keydown', (e) => {
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
-    keys[e.key.toLowerCase()] = true;
-    if (e.key === 'Enter' && state === 'title') startGame();
-    if (e.key.toLowerCase() === 'r' && (state === 'crashed' || state === 'landed')) restart();
-    if (e.key.toLowerCase() === 'r' && state === 'fly') restart();
-    if (e.key.toLowerCase() === 'p' && state === 'fly') paused = !paused;
-    if (e.key.toLowerCase() === 'c' && state === 'fly') cockpit = !cockpit;
-    if (e.key.toLowerCase() === 'h' && (state === 'fly' || state === 'title')) help = !help;
-    if (e.key.toLowerCase() === 'g' && state === 'fly') {
-      plane.gearDown = !plane.gearDown;
-      beep(plane.gearDown ? 520 : 380, 0.08, 'square', 0.07);
-    }
-    if (e.key.toLowerCase() === 'f' && state === 'fly') {
-      plane.flaps = !plane.flaps;
-      beep(plane.flaps ? 600 : 440, 0.08, 'square', 0.07);
-    }
-    if (e.key.toLowerCase() === 'b' && state === 'fly') plane.speedbrake = true;
+const game = {
+  missionIndex: 0,
+  mission: MISSIONS[0],
+  state: null,
+  mode: 'title', // title | flying | paused | over
+  cameraMode: 'chase',
+  frozen: false,
+  phase: 'golden',
+  time: 0,
+  frameCount: 0,
+  frameMsEMA: 0,
+  worstMs: 0,
+  ringPulse: 0,
+  simResult: null,
+  ready: false,
+};
+window.__ember = game;
+
+// Live dashboard needles: each dial maps its value to -120..+120 deg.
+const dialNeedles = [...document.querySelectorAll('#cockpit-dash .dial .needle')];
+function updateDials(s) {
+  if (!dialNeedles.length) return;
+  const altFt = Math.max(0, s.y * 3.28084);
+  const hd = ((Math.round((s.heading * 180) / Math.PI) % 360) + 360) % 360;
+  const vals = [
+    Math.min(1, altFt / 2500), // ALT 0..2500 ft
+    Math.min(1, s.speedKts / 200), // SPD 0..200 kt
+    hd / 360, // HDG 0..360 deg
+    Math.max(0, Math.min(1, s.fuel / 100)), // FUEL 0..100%
+  ];
+  dialNeedles.forEach((n, i) => {
+    n.style.transform = `rotate(${-120 + vals[i] * 240}deg)`;
   });
-  window.addEventListener('keyup', (e) => {
-    keys[e.key.toLowerCase()] = false;
-    if (e.key.toLowerCase() === 'b') plane.speedbrake = false;
-  });
-  canvas.addEventListener('mousemove', (e) => {
-    mouse.x = (e.clientX / W) * 2 - 1;
-    mouse.y = (e.clientY / H) * 2 - 1;
-  });
-  canvas.addEventListener('click', () => {
-    if (state === 'title') { startGame(); return; }
-    mouseSteer = !mouseSteer;
-  });
+}
 
-  // ---- tiny synth (no audio assets) ----
-  let audioCtx = null;
-  function beep(freq, dur, type, vol, when) {
-    try {
-      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
-      const t = audioCtx.currentTime + (when || 0);
-      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-      o.type = type || 'sine'; o.frequency.value = freq;
-      g.gain.setValueAtTime(vol || 0.12, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-      o.connect(g); g.connect(audioCtx.destination);
-      o.start(t); o.stop(t + dur + 0.02);
-    } catch (err) { /* audio is optional */ }
-  }
-  function ringChime() { beep(880, 0.14, 'sine', 0.14); beep(1318, 0.22, 'sine', 0.12, 0.09); }
-  function landFanfare() { [523, 659, 784, 1046].forEach((f, i) => beep(f, 0.2, 'triangle', 0.12, i * 0.11)); }
-  function crashThud() { beep(90, 0.5, 'sawtooth', 0.16); beep(55, 0.7, 'sine', 0.18, 0.05); }
+let ringGroup = null;
+let ringMeshes = [];
 
-  function startGame() {
-    plane.reset();
-    score = 0; ringsGot = 0; timeSec = 0; endTimer = 0;
-    for (let i = 0; i < 6; i++) passed[i] = false;
-    for (let i = 0; i < 6; i++) prevRingDist[i] = 0;
-    scorePopups.length = 0;
-    state = 'fly';
-    banner = 'FLY THE COAST — THREAD RING 1';
-    bannerUntil = performance.now() / 1000 + 3;
-    beep(660, 0.12, 'triangle', 0.1);
-  }
-  function restart() { startGame(); }
+function loadMission(i, keepState) {
+  game.missionIndex = ((i % MISSIONS.length) + MISSIONS.length) % MISSIONS.length;
+  game.mission = MISSIONS[game.missionIndex];
+  if (ringGroup) { scene.remove(ringGroup.group); }
+  const built = buildRings(scene, game.mission.rings);
+  ringGroup = built.group; ringMeshes = built.meshes;
+  game.phase = game.mission.timeOfDay;
+  applySkyPhase(world, scene, game.phase);
+  if (!keepState) game.state = newFlightState(game.mission);
+  game.state.message = game.mission.radio[0];
+  game.state.messageAt = 0;
+}
 
-  // ---- autopilot: steer toward a target point (title attract + shots) ----
-  // On final approach it also configures the plane for landing: gear down
-  // and flaps out, exactly what the sim and the title flight rely on.
-  function autopilot(tx, ty, tz) {
-    const dx = tx - plane.x, dz = tz - plane.z;
-    const wantYaw = Math.atan2(dx, -dz);
-    let dyaw = wantYaw - plane.yaw;
-    while (dyaw > Math.PI) dyaw -= Math.PI * 2;
-    while (dyaw < -Math.PI) dyaw += Math.PI * 2;
-    const wantPitch = clamp((ty - plane.y) * 0.004, -0.25, 0.25);
-    // Final approach: inside 1000 m of the runway and below 160 m, land
-    // configured — gear down, flaps out.
-    const rdx = plane.x - WORLD.runway.x, rdz = plane.z - WORLD.runway.z;
-    if (rdx * rdx + rdz * rdz < 1000 * 1000 && plane.y < 160) {
-      plane.gearDown = true;
-      plane.flaps = true;
-    }
-    return {
-      roll: clamp(-dyaw * 1.6, -1, 1),
-      pitch: clamp((wantPitch - plane.pitch) * 3, -1, 1),
-      throttle: 0,
-    };
-  }
+function startFlying() {
+  game.mode = 'flying';
+  hideScreen(hud);
+  audio.ensure();
+}
 
-  function nextTarget() {
-    for (let i = 0; i < 6; i++) {
-      if (!passed[i]) return { p: WORLD.rings[i], ring: i };
-    }
-    return { p: { x: WORLD.runway.x, y: 60, z: WORLD.runway.z }, ring: -1 };
-  }
+function applyShot(n) {
+  const shot = getShot(n);
+  loadMission(shot.missionIndex);
+  game.cameraMode = shot.camera;
+  game.frozen = true;
+  game.mode = 'flying';
+  hideScreen(hud);
+  const s = game.state;
+  Object.assign(s, shot.pose);
+  s.time = 42;
+  s.message = shot.radio;
+  s.messageAt = s.time;
+  s.gearDown = true;
+  applySkyPhase(world, scene, shot.phase);
+  game.phase = shot.phase;
+}
 
-  function checkRings() {
-    for (let i = 0; i < 6; i++) {
-      if (passed[i]) continue;
-      const R = WORLD.rings[i];
-      const dz = plane.z - R.z;
-      if (prevRingDist[i] > 0 && dz <= 0) {
-        const dx = plane.x - R.x, dy = plane.y - R.y;
-        if (Math.hypot(dx, dy) < R.r) {
-          passed[i] = true; ringsGot++;
-          score += 100;
-          ringChime();
-          // Floating "+100" at the ring, visible for 1.2 s (wall clock,
-          // so it matches the nowSec the renderer passes in).
-          scorePopups.push({ x: R.x, y: R.y, z: R.z, text: '+100', until: performance.now() / 1000 + 1.2 });
-          if (scorePopups.length > 4) scorePopups.shift();
-          if (ringsGot < 6) {
-            banner = `RING ${i + 1} CLEAR — NEXT: RING ${i + 2}`;
-            bannerUntil = performance.now() / 1000 + 2.5;
-          } else {
-            banner = 'ALL RINGS CLEAR — LAND ON THE RUNWAY';
-            bannerUntil = performance.now() / 1000 + 4;
-          }
-        }
-      }
-    }
-    for (let i = 0; i < 6; i++) prevRingDist[i] = plane.z - WORLD.rings[i].z;
+function updateCamera(dt) {
+  const s = game.state;
+  const fwd = new THREE.Vector3(Math.sin(s.heading), 0, -Math.cos(s.heading));
+  const up = new THREE.Vector3(0, 1, 0);
+  const pos = new THREE.Vector3(s.x, s.y, s.z);
+  let target, look;
+  if (game.cameraMode === 'hero') {
+    // Hero: rear-starboard 3/4 showcase — the whole floatplane big in
+    // frame, seen from behind-starboard with the nose pointing up-frame
+    // toward the next ring and the Ember Arch down-frame in the sea.
+    // Deterministic: no time dependence, so a frozen shot renders
+    // identically every load.
+    plane.userData.canopy.visible = true;
+    plane.userData.panelGlow.visible = true;
+    const right = new THREE.Vector3(Math.cos(s.heading), 0, Math.sin(s.heading));
+    target = pos.clone().addScaledVector(fwd, -20).addScaledVector(right, 19).add(new THREE.Vector3(0, 5, 0));
+    // Look 5 m above the plane: it drops the plane into the free slot
+    // between the mission panel (ends y~200) and the gauges (start
+    // y~250), so the tail fin clears the panel instead of hiding behind
+    // it. The arch's lintel stays high in the frame, clear of the HUD.
+    look = pos.clone().addScaledVector(fwd, 10).add(new THREE.Vector3(0, 5, 0));
+    dashEl.classList.add('hidden');
+    document.body.classList.remove('cockpit');
+    document.body.classList.add('hero');
+  } else if (game.cameraMode === 'cockpit') {
+    // Cockpit camera: pilot's-eye, at the canopy, BELOW the high wing —
+    // the orange cowling runs down the centre to the cream nose cone and
+    // the spinner, the wing struts angle up at the frame edges, horizon
+    // ahead. (A camera above the wing can never see the nose: the wing
+    // itself blocks it. The canopy glass and panel glow are hidden from
+    // this camera; they sit around the pilot, not in front of him.)
+    target = pos.clone().addScaledVector(fwd, 2.0).add(new THREE.Vector3(0, 2.4, 0));
+    look = pos.clone().addScaledVector(fwd, 220).add(new THREE.Vector3(0, -2 + Math.sin(s.pitch) * 40, 0));
+    plane.userData.canopy.visible = false;
+    plane.userData.panelGlow.visible = false;
+    dashEl.classList.remove('hidden');
+    document.body.classList.add('cockpit');
+    document.body.classList.remove('hero');
+  } else if (game.cameraMode === 'orbit') {
+    plane.userData.canopy.visible = true;
+    plane.userData.panelGlow.visible = true;
+    const a = game.time * 0.12;
+    target = pos.clone().add(new THREE.Vector3(Math.sin(a) * 42, 12, Math.cos(a) * 42));
+    look = pos.clone();
+    dashEl.classList.add('hidden');
+    document.body.classList.remove('cockpit');
+    document.body.classList.remove('hero');
+  } else {
+    // Chase: behind and above, eased so the camera never fights the pilot.
+    plane.userData.canopy.visible = true;
+    plane.userData.panelGlow.visible = true;
+    const back = pos.clone().addScaledVector(fwd, -40).add(new THREE.Vector3(0, 10.5, 0));
+    if (!updateCamera.last) updateCamera.last = back.clone();
+    updateCamera.last.lerp(back, Math.min(1, dt * 4));
+    target = updateCamera.last.clone();
+    look = pos.clone().addScaledVector(fwd, 60).add(new THREE.Vector3(0, 1, 0));
+    dashEl.classList.add('hidden');
+    document.body.classList.remove('cockpit');
+    document.body.classList.remove('hero');
   }
+  camera.position.copy(target);
+  camera.lookAt(look);
+  // Roll the chase camera a little with the bank so turns feel banked.
+  if (game.cameraMode === 'chase') camera.rotation.z += s.bank * 0.35;
+}
 
-  function playerInput() {
-    let roll = 0, pitch = 0, throttle = 0;
-    if (keys['arrowleft'] || keys['a']) roll -= 1;
-    if (keys['arrowright'] || keys['d']) roll += 1;
-    if (keys['arrowup'] || keys['w']) pitch += 1;
-    if (keys['arrowdown'] || keys['s']) pitch -= 1;
-    if (keys['shift']) throttle += 1;
-    if (keys['control']) throttle -= 1;
-    if (keys['='] || keys['+']) throttle += 1;
-    if (keys['-'] || keys['_']) throttle -= 1;
-    if (mouseSteer) {
-      roll = clamp(mouse.x * 1.1, -1, 1);
-      pitch = clamp(-mouse.y * 0.9, -1, 1);
-    }
-    return { roll, pitch, throttle };
-  }
+function setRadioLines() {
+  const s = game.state, m = game.mission;
+  if (m.radio[1] && s.time > 14 && s.time < 14.5) { s.message = m.radio[1]; s.messageAt = s.time; }
+}
 
-  // ---- cameras ----
-  const camPos = { x: 0, y: 0, z: 0 };
-  function updateCamera(dt, snap) {
-    // Forward vector inline — plane.forward() would allocate per frame.
-    const fx = Math.sin(plane.yaw), fz = -Math.cos(plane.yaw);
-    let tx, ty, tz, tyaw, tpitch;
-    if (cockpit) {
-      tx = plane.x + fx * 3; ty = plane.y + 1.6; tz = plane.z + fz * 3;
-      tyaw = plane.yaw; tpitch = plane.pitch * 0.8;
-    } else {
-      tx = plane.x - fx * 30; ty = plane.y + 10 - plane.pitch * 12; tz = plane.z - fz * 30;
-      tyaw = plane.yaw; tpitch = plane.pitch * 0.45 - 0.05;
-    }
-    if (snap) { camPos.x = tx; camPos.y = ty; camPos.z = tz; }
-    else {
-      const k = 1 - Math.pow(0.00005, dt);
-      camPos.x = lerp(camPos.x, tx, k);
-      camPos.y = lerp(camPos.y, ty, k);
-      camPos.z = lerp(camPos.z, tz, k);
-    }
-    cam.x = camPos.x; cam.y = camPos.y; cam.z = camPos.z;
-    cam.yaw = tyaw; cam.pitch = tpitch;
-  }
-
-  // ---- screenshot compositions (frozen frames) ----
-  function applyShot() {
-    scorePopups.length = 0;
-    if (SHOT === 'cockpit') {
-      cockpit = true;
-      plane.x = 100; plane.y = 195; plane.z = -2250;
-      plane.yaw = 0.02; plane.pitch = -0.02; plane.roll = 0.04;
-      plane.speed = 58; plane.throttle = 0.68; plane.gearDown = true; plane.flaps = true;
-      plane.fuel = 62;
-      for (let i = 0; i < 5; i++) passed[i] = true;
-      ringsGot = 5; score = 500; timeSec = 148; state = 'fly';
-    } else if (SHOT === 'rings') {
-      // Ring 4 looms 130 m ahead, framing the plane with its RING 4 label.
-      // (The +100 popup is a live-play moment — it fires on a real ring
-      // pass, proven in the headless sim and in a live capture — not staged
-      // here, because no ring was just passed in this pose.)
-      plane.x = 55; plane.y = 252; plane.z = -920;
-      plane.yaw = -0.04; plane.pitch = 0.02; plane.roll = -0.12;
-      plane.speed = 62; plane.throttle = 0.72;
-      plane.fuel = 55;
-      for (let i = 0; i < 3; i++) passed[i] = true;
-      ringsGot = 3; score = 300; timeSec = 96; state = 'fly';
-    } else if (SHOT === 'landing') {
-      // Cockpit view on short final: 140 m out, the runway fills the
-      // windscreen and the PAPI lights read at the threshold.
-      cockpit = true;
-      plane.x = 150; plane.y = 55; plane.z = -2900;
-      plane.yaw = 0; plane.pitch = -0.05; plane.roll = 0;
-      plane.speed = 42; plane.throttle = 0.4; plane.gearDown = true; plane.flaps = true;
-      plane.fuel = 38;
-      for (let i = 0; i < 6; i++) passed[i] = true;
-      ringsGot = 6; score = 600; timeSec = 212; state = 'fly';
-    } else { // chase (default)
-      // Ring 3 sits 400 m ahead, a clear gold ring over the coast.
-      plane.x = -30; plane.y = 215; plane.z = 200;
-      plane.yaw = -0.03; plane.pitch = 0.01; plane.roll = -0.08;
-      plane.speed = 56; plane.throttle = 0.65;
-      plane.fuel = 85;
-      for (let i = 0; i < 2; i++) passed[i] = true;
-      ringsGot = 2; score = 200; timeSec = 44; state = 'fly';
-    }
-    updateCamera(0, true);
-  }
-
-  // ---- render ----
-  // The horizon-haze gradient depends only on the (rounded) horizon line:
-  // rebuild it only when the horizon moved, not every frame.
-  let hazeGrad = null, hazeGradY = -1;
-  function render(nowSec) {
-    drawSky(ctx, world, cam, nowSec);
-    drawClouds(ctx, world, cam, nowSec);
-    drawSea(ctx, world, cam, nowSec);
-    projectTerrain(world, cam);
-    const n = collectDrawItems(world, cam);
-    const items = world.items;
-    const order = world.drawOrder.subarray(0, n);
-    order.sort((a, b) => items[b].d - items[a].d);
-    for (let i = 0; i < n; i++) drawItem(ctx, world, cam, items[order[i]]);
-    // Horizon haze: warm band where the sea meets the sky.
-    const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
-    const hp = cam.project(cam.x + fx * 6000, 0, cam.z + fz * 6000);
-    if (hp) {
-      const hyR = Math.round(hp.y / 3) * 3;
-      if (!hazeGrad || hazeGradY !== hyR) {
-        const hz = ctx.createLinearGradient(0, hyR - 26, 0, hyR + 30);
-        hz.addColorStop(0, 'rgba(255,160,80,0)');
-        hz.addColorStop(0.5, 'rgba(255,160,80,0.20)');
-        hz.addColorStop(1, 'rgba(255,160,80,0)');
-        hazeGrad = hz; hazeGradY = hyR;
-      }
-      ctx.fillStyle = hazeGrad;
-      ctx.fillRect(0, hp.y - 26, W, 56);
-    }
-    drawRunway(ctx, world, cam);
-    drawPapi(ctx, world, cam, plane);
-    drawLighthouse(ctx, world, cam, nowSec);
-    drawRings(ctx, world, cam, passed, state !== 'title');
-    if (!cockpit) {
-      if (state === 'title') drawChasePlane(ctx, plane, W, H, nowSec, 0.55, 0.88);
-      else drawChasePlane(ctx, plane, W, H, nowSec);
-    } else drawCockpitFrame(ctx, plane, W, H);
-    // HUD + instruments (not on the title screen's attract flight? keep them: they sell the game).
-    let objective = 'THREAD THE RINGS';
-    if (state === 'fly') {
-      objective = ringsGot < 6
-        ? `THREAD THE RINGS — NEXT: RING ${ringsGot + 1} OF 6`
-        : 'ALL RINGS CLEAR — LAND ON THE RUNWAY';
-    }
-    drawHud(ctx, plane, score, ringsGot, 6, timeSec, objective, nowSec);
-    drawInstruments(ctx, plane, W, H, cockpit);
-    drawMinimap(ctx, plane, world, passed, W, H);
-    drawScorePopups(ctx, cam, scorePopups, nowSec);
-    if (mouseSteer && state === 'fly') {
-      ctx.save();
-      ctx.font = 'bold 12px Arial, sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillStyle = 'rgba(255,255,255,0.75)';
-      ctx.fillText('MOUSE STEERING ON — CLICK TO RELEASE', 16, H - 16);
-      ctx.restore();
-    }
-    if (banner && nowSec < bannerUntil && state === 'fly') {
-      drawBanner(ctx, banner, '', W, H);
-    }
-    if (paused) drawBanner(ctx, 'PAUSED', 'Press P to resume', W, H);
-    if (help) drawHelp(ctx, W, H);
-    if (state === 'title') drawTitle(ctx, W, H, nowSec);
-    if ((state === 'landed' || state === 'crashed') && endTimer <= 0) {
-      drawEnd(ctx, W, H, state === 'landed' ? 'landed' : plane.crashReason,
-        score, ringsGot, 6, timeSec);
-    }
-  }
-
-  // ---- main loop ----
-  let last = performance.now();
-  let firstFrame = true;
-  let perfPrev = 0;
-  if (SHOT) applyShot();
-  if (DEMO && !SHOT) startGame();
-  function frame(nowMs) {
-    const nowSec = SHOT ? SHOT_TIME : nowMs / 1000;
-    let dt = Math.min(0.05, (nowMs - last) / 1000);
-    last = nowMs;
-    if (!SHOT && !paused) {
-      if (state === 'title') {
-        const t = nextTarget().p;
-        plane.update(dt, autopilot(t.x, t.y, t.z));
-        if (plane.landed || plane.crashed) plane.reset();
-        // Loop the attract flight: back to the start after the runway.
-        if (plane.z < WORLD.runway.z - 200) plane.reset();
-      } else if (state === 'fly') {
-        timeSec += dt;
-        // Demo mode flies the autopilot (same steering law as the title
-        // attract flight); otherwise the player flies.
-        const tgt = nextTarget();
-        const input = DEMO ? autopilot(tgt.p.x, tgt.p.y, tgt.p.z) : playerInput();
-        plane.update(dt, input);
-        checkRings();
-        // Low-fuel warning: one double-beep as the gauge crosses 25%.
-        if (plane.fuel < 25 && !plane.lowFuelWarned) {
-          plane.lowFuelWarned = true;
-          beep(440, 0.25, 'square', 0.1);
-          beep(440, 0.25, 'square', 0.1, 0.35);
-        }
-        if (plane.landed) {
-          score += 500 + Math.max(0, 300 - Math.floor(timeSec));
-          landFanfare();
-          state = 'landed'; endTimer = 0.9;
-        } else if (plane.crashed) {
-          crashThud();
-          state = 'crashed'; endTimer = 0.9;
-        }
-      } else if (endTimer > 0) {
-        endTimer -= dt;
-      }
-      updateCamera(dt, firstFrame);
-    } else if (SHOT) {
-      updateCamera(0, true);
-    }
-    firstFrame = false;
-    if (perf) {
-      const t0 = performance.now();
-      render(nowSec);
-      perf.renders.push(performance.now() - t0);
-      if (perfPrev) perf.deltas.push(nowMs - perfPrev);
-      perfPrev = nowMs;
-    } else render(nowSec);
-    requestAnimationFrame(frame);
-  }
-  updateCamera(0, true);
+let last = performance.now();
+function frame(now) {
   requestAnimationFrame(frame);
-})();
+  const t0 = performance.now();
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now;
+  game.time += dt;
+  game.frameCount++;
+
+  const { input, events } = inputCtl.poll();
+  for (const ev of events) {
+    if (ev.type === 'start' && game.mode === 'title') startFlying();
+    if (ev.type === 'camera') {
+      game.cameraMode = game.cameraMode === 'chase' ? 'cockpit' : game.cameraMode === 'cockpit' ? 'orbit' : 'chase';
+    }
+    if (ev.type === 'gear' && game.state) game.state.gearDown = !game.state.gearDown;
+    if (ev.type === 'flaps' && game.state) game.state.flaps = game.state.flaps ? 0 : 1;
+    if (ev.type === 'pause' && game.mode === 'flying') game.mode = 'paused';
+    else if (ev.type === 'pause' && game.mode === 'paused') game.mode = 'flying';
+    if (ev.type === 'restart') { loadMission(game.missionIndex); game.mode = 'flying'; hideScreen(hud); }
+    if (ev.type === 'mute') audio.toggleMute();
+    if (ev.type === 'mission') { loadMission(ev.index); game.mode = 'flying'; hideScreen(hud); }
+    if (ev.type === 'wheel' && game.state) game.state.throttle = Math.max(0, Math.min(1, game.state.throttle + ev.delta));
+  }
+
+  const s = game.state;
+  if (game.mode === 'flying' && !game.frozen) {
+    let drive = input;
+    if (DEMO || SIM) {
+      const tgt = autopilotTarget(s, game.mission);
+      drive = autopilotInput(s, game.mission, tgt);
+    }
+    const prevRings = s.ringsPassed;
+    const prevFinished = s.finished;
+    stepFlight(s, game.mission, drive, dt);
+    if (s.ringsPassed > prevRings) audio.ring();
+    if (s.finished && !prevFinished) { if (s.crashed) audio.crash(); else audio.land(); }
+    setRadioLines();
+    audio.update(s);
+    if (s.finished) {
+      game.mode = 'over';
+      const mins = Math.floor(s.time / 60), secs = Math.floor(s.time % 60);
+      showScreen(hud, `<div class="screen-inner"><h1>${s.won ? '★ SORTIE COMPLETE ★' : s.crashed ? 'AIRCRAFT LOST' : 'LANDED'}</h1>
+        <p class="title-sub">${game.mission.name} — ${s.ringsPassed}/${game.mission.rings.length} rings · ${mins}:${String(secs).padStart(2, '0')} · fuel ${Math.round(s.fuel)}% left</p>
+        <p class="title-sub">SCORE <b>${s.score.toLocaleString('en-US')}</b> &nbsp;·&nbsp; R — fly again &nbsp;·&nbsp; 1–8 — next sortie</p></div>`);
+    }
+  }
+
+  // Ring pulse: the live ring breathes so the eye finds it.
+  game.ringPulse += dt;
+  ringMeshes.forEach((m, i) => {
+    if (i === s.ringIndex) {
+      const k = 1 + Math.sin(game.ringPulse * 4) * 0.08;
+      m.scale.setScalar(k);
+      m.material.color.setHex(0xffb020);
+    } else if (i < s.ringIndex) {
+      m.material.color.setHex(0x2aff5a);
+      m.scale.setScalar(1);
+    } else {
+      m.material.color.setHex(0xff5a1a);
+      m.scale.setScalar(1);
+    }
+  });
+
+  // Clouds drift with the wind; smoke rises off the crater.
+  for (const cl of world.clouds) {
+    cl.position.x += cl.userData.speed * dt;
+    if (cl.position.x > 2900) cl.position.x = -2900;
+  }
+  world.smoke.children.forEach((puff, i) => {
+    puff.position.y += dt * 3;
+    if (puff.position.y > 450 + 9 * 24 + 60) puff.position.y = 450 + i * 24;
+  });
+
+  posePlane(plane, s);
+  updateCamera(game.mode === 'title' ? 0.016 : dt);
+  renderer.render(scene, camera);
+  updateHud(hud, s, game.mission, { paused: game.mode === 'paused' });
+  updateDials(s);
+
+  const ms = performance.now() - t0;
+  game.frameMsEMA = game.frameCount <= 2 ? ms : game.frameMsEMA * 0.95 + ms * 0.05;
+  if (ms > game.worstMs) game.worstMs = ms;
+  if (game.frameCount === 30) game.ready = true;
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---- boot ----
+loadMission(0);
+if (SHOT) {
+  applyShot(SHOT);
+} else if (SIM) {
+  loadMission(SIM_MISSION - 1);
+  game.mode = 'flying';
+  hideScreen(hud);
+} else if (DEMO) {
+  game.mode = 'flying';
+  hideScreen(hud);
+  game.state.throttle = 0.6;
+} else {
+  game.mode = 'title';
+  game.cameraMode = 'orbit';
+  showScreen(hud, titleScreenHtml());
+  game.state.throttle = 0;
+}
+if (SIM) {
+  // Accelerated in-browser sim: run the real model at 20x until the sortie ends.
+  const runSim = () => {
+    const s = game.state, m = game.mission;
+    let steps = 0;
+    while (!s.finished && steps < 60 * 12 * 20) {
+      const tgt = autopilotTarget(s, m);
+      stepFlight(s, m, autopilotInput(s, m, tgt), 1 / 60);
+      steps++;
+    }
+    game.simResult = {
+      mission: m.id, name: m.name, rings: `${s.ringsPassed}/${m.rings.length}`,
+      score: s.score, time: Math.round(s.time * 10) / 10, landed: s.landed,
+      crashed: s.crashed, won: s.won, fuel: Math.round(s.fuel), damage: Math.round(s.damage),
+      steps,
+    };
+    document.title = 'SIM-DONE ' + JSON.stringify(game.simResult);
+  };
+  setTimeout(runSim, 600);
+}
+requestAnimationFrame(frame);

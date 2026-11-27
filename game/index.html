@@ -1,21 +1,101 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sunset Strait — a coastal flight game</title>
+<title>Ember Strait — Volcanic Archipelago Flight</title>
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #0b1020; overflow: hidden; }
-  #game { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a1026; font-family: "Segoe UI", system-ui, sans-serif; }
+  #scene { position: fixed; inset: 0; }
+  #scene canvas { display: block; }
+  #hud { position: fixed; inset: 0; pointer-events: none; color: #fff; }
+  .panel { background: rgba(8, 18, 34, 0.72); border: 1px solid rgba(255,255,255,0.25); border-radius: 8px; padding: 8px 12px; backdrop-filter: blur(2px); }
+  #hud-top { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  #mission-panel { max-width: 330px; }
+  #mission-mode { font-size: 11px; letter-spacing: 2px; color: #ffb020; font-weight: 700; }
+  #mission-name { font-size: 21px; font-weight: 800; line-height: 1.1; }
+  #mission-brief { font-size: 12px; opacity: 0.9; margin-top: 2px; }
+  #objectives { margin-top: 6px; font-size: 12px; font-weight: 600; }
+  .obj { color: #cfe0f0; }
+  .obj.live { color: #ffb020; }
+  .obj.done { color: #7dff9a; }
+  #score-line { margin-top: 6px; font-size: 13px; }
+  #score-line b { color: #ffd27a; font-size: 16px; }
+  #compass-wrap { position: relative; width: 300px; height: 30px; overflow: hidden; background: rgba(8,18,34,0.72); border: 1px solid rgba(255,255,255,0.25); border-radius: 6px; margin-top: 2px; }
+  #compass { position: absolute; inset: 0; }
+  #compass .tick { position: absolute; top: 2px; font-size: 11px; font-weight: 700; color: #cfe0f0; transform: translateX(-50%); text-align: center; }
+  #compass .tick i { display: block; width: 2px; height: 6px; background: #fff; margin: 1px auto 0; }
+  #compass-needle { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); color: #ffb020; font-size: 13px; }
+  #sys-panel { min-width: 210px; font-size: 13px; }
+  .sys-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .sys-row span { width: 42px; opacity: 0.75; font-size: 11px; letter-spacing: 1px; }
+  .sys-row b { margin-left: auto; }
+  .bar { flex: 1; height: 8px; background: rgba(255,255,255,0.18); border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: #7dff9a; }
+  #radio { position: absolute; top: 150px; left: 50%; transform: translateX(-50%); background: rgba(8,18,34,0.85); border: 1px solid #ffb020; border-radius: 6px; padding: 8px 16px; font-size: 14px; font-weight: 600; max-width: 640px; text-align: center; }
+  #centre-msg { position: absolute; top: 38%; left: 50%; transform: translate(-50%, -50%); font-size: 42px; font-weight: 900; letter-spacing: 3px; text-shadow: 0 2px 12px rgba(0,0,0,0.7); }
+  #centre-msg.win { color: #7dff9a; }
+  #centre-msg.lose { color: #ff5a4d; }
+  #centre-msg.pause { color: #ffb020; font-size: 30px; }
+  #hud-bottom { position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; justify-content: space-between; align-items: flex-end; gap: 10px; }
+  #gauges { display: flex; gap: 18px; align-items: stretch; }
+  .gauge { text-align: center; min-width: 110px; }
+  .g-label { font-size: 10px; letter-spacing: 2px; opacity: 0.75; }
+  .g-big { font-size: 34px; font-weight: 800; line-height: 1; color: #ffd27a; }
+  .g-big small { font-size: 13px; color: #fff; }
+  .g-sub { font-size: 12px; margin-top: 2px; }
+  #thr-wrap { display: flex; flex-direction: column; align-items: center; }
+  #thr-bar { width: 14px; height: 64px; background: rgba(255,255,255,0.18); border-radius: 7px; overflow: hidden; display: flex; align-items: flex-end; }
+  #thr-fill { display: block; width: 100%; background: linear-gradient(#ff5a1a, #ffb020); }
+  #minimap-wrap { padding: 6px; }
+  #minimap { display: block; border-radius: 4px; }
+  #minimap-label { font-size: 10px; letter-spacing: 1px; text-align: center; opacity: 0.8; margin-top: 3px; }
+  #hint { position: absolute; bottom: 132px; left: 50%; transform: translateX(-50%); font-size: 12px; font-weight: 600; color: #fff; background: rgba(8,18,34,0.88); border: 1px solid rgba(255,255,255,0.35); border-radius: 6px; padding: 4px 12px; white-space: nowrap; }
+  #cockpit-dash { position: fixed; left: 0; right: 0; bottom: 0; height: 76px; pointer-events: none;
+    background: linear-gradient(to top, rgba(10,12,18,0.96) 55%, rgba(10,12,18,0.0));
+    display: flex; justify-content: center; align-items: flex-end; gap: 22px; padding-bottom: 8px; }
+  #cockpit-dash .dial { width: 56px; height: 56px; border-radius: 50%; border: 3px solid #3a4356; background: radial-gradient(circle at 50% 40%, #1a2233, #0a0e18); position: relative; }
+  #cockpit-dash .dial .needle { position: absolute; left: calc(50% - 1.5px); top: 50%; width: 3px; height: 20px; background: #7dffb0; transform-origin: 50% 0; }
+  #cockpit-dash .dial b { position: absolute; left: 0; right: 0; bottom: 7px; text-align: center; color: #ffd27a; font-size: 10px; }
+  #cockpit-dash .dash-lights { display: flex; gap: 8px; align-items: center; padding-bottom: 18px; }
+  body.cockpit #hud-bottom { bottom: 86px; }
+  body.cockpit #hint { bottom: 198px; }
+  /* Hero showcase: the radio pill and the hint pill would cross the
+     frame centre exactly where the plane sits, so the hero camera hides
+     those two transient text pills. The mission panel, compass, system
+     panel, gauges, minimap and dials all stay — the simulator HUD is
+     intact. */
+  body.hero #radio, body.hero #hint { display: none; }
+  #cockpit-dash .dash-lights i { width: 12px; height: 12px; border-radius: 50%; background: #2aff5a; box-shadow: 0 0 8px #2aff5a; }
+  #cockpit-dash .dash-lights i:nth-child(2) { background: #ffb020; box-shadow: 0 0 8px #ffb020; }
+  #cockpit-dash .dash-lights i:nth-child(3) { background: #ff2a2a; box-shadow: 0 0 8px #ff2a2a; }
+  .hidden { display: none !important; }
+  #screen { position: fixed; inset: 0; background: rgba(6, 10, 22, 0.55); display: flex; align-items: center; justify-content: center; pointer-events: none; }
+  .screen-inner { text-align: center; max-width: 720px; padding: 30px; background: rgba(8,18,34,0.82); border: 1px solid rgba(255,176,32,0.5); border-radius: 14px; color: #fff; }
+  .title-kicker { letter-spacing: 3px; font-size: 12px; color: #ffb020; font-weight: 700; }
+  .screen-inner h1 { font-size: 58px; margin: 6px 0; letter-spacing: 4px; }
+  .title-sub { font-size: 15px; line-height: 1.5; opacity: 0.92; }
+  .title-modes { margin: 14px 0; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  .title-modes span { border: 1px solid #ffb020; color: #ffd27a; border-radius: 20px; padding: 5px 12px; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+  .title-keys { font-size: 13px; opacity: 0.85; }
+  .title-foot { font-size: 12px; opacity: 0.65; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 </style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.min.js" } }
+</script>
 </head>
 <body>
-<canvas id="game" width="1280" height="720"></canvas>
-<script src="src/math3d.js"></script>
-<script src="src/world.js"></script>
-<script src="src/plane.js"></script>
-<script src="src/hud.js"></script>
-<script src="src/features.js"></script>
-<script src="src/main.js"></script>
+<div id="scene"></div>
+<div id="hud"></div>
+<div id="cockpit-dash" class="hidden">
+  <div class="dial"><i class="needle" data-dial="alt"></i><b>ALT</b></div>
+  <div class="dial"><i class="needle" data-dial="spd"></i><b>SPD</b></div>
+  <div class="dash-lights"><i></i><i></i><i></i></div>
+  <div class="dial"><i class="needle" data-dial="hdg"></i><b>HDG</b></div>
+  <div class="dial"><i class="needle" data-dial="fuel"></i><b>FUEL</b></div>
+</div>
+<p id="status" role="status" aria-live="polite"></p>
+<script type="module" src="./src/main.js"></script>
 </body>
 </html>

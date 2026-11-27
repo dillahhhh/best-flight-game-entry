@@ -1,13 +1,9 @@
-// Sunset Strait — make.fun hand-in program (Node 22, standard library only).
+// Ember Strait — best-flight-game-20261126-0057 entry program (Node 22,
+// standard library only). It hands the game in: copies this repository's
+// game/ and screenshots/ beside this file into /output (or
+// MAKEFUN_OUTPUT_DIR outside the grader) and writes /output/dossier.json
+// with buildDossier from the vendored make.fun library.
 //
-// The game lives in game/ beside this file: plain static files a desktop
-// browser loads offline (game/index.html and its scripts, no library, no
-// network request). This program hands it in: it copies game/ and
-// screenshots/ into the output directory and writes dossier.json there, the
-// summary the judge reads, built with the vendored make.fun library.
-//
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -18,25 +14,23 @@ import { buildDossier } from './vendor/makefun-game.ts';
 const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-function handIn(sourceDir: string, targetDir: string): void {
-  mkdirSync(targetDir, { recursive: true });
-  if (existsSync(sourceDir)) cpSync(sourceDir, targetDir, { recursive: true });
+mkdirSync(out, { recursive: true });
+cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
+mkdirSync(join(out, 'screenshots'), { recursive: true });
+if (existsSync(join(here, 'screenshots'))) {
+  cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
 }
 
-mkdirSync(out, { recursive: true });
-handIn(join(here, 'game'), join(out, 'game'));
-handIn(join(here, 'screenshots'), join(out, 'screenshots'));
-
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the
-// bytes; the rest refuse an entry the scorer would refuse — more than 4
-// screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of
-// game files in all, or a path under game/ over 1000 bytes.
-const dossier = buildDossier(out, {
-  text_max_bytes: 163840,
-  screenshots: { max: 4, max_bytes: 262144 },
-  game_max_files: 993,
-  game_max_bytes: 50331648,
-  game_path_max_bytes: 1000,
-});
-writeFileSync(join(out, 'dossier.json'), dossier);
-console.log(`handed in: ${out} (dossier ${dossier.length} bytes)`);
+// Gate caps from the competition rules: dossier text at most 160 KiB,
+// at most 4 screenshots of at most 256 KiB each, game/ at most 993
+// files and 48 MiB, paths at most 1000 bytes.
+writeFileSync(
+  join(out, 'dossier.json'),
+  buildDossier(out, {
+    text_max_bytes: 163840,
+    screenshots: { max: 4, max_bytes: 262144 },
+    game_max_files: 993,
+    game_max_bytes: 50331648,
+    game_path_max_bytes: 1000,
+  }),
+);

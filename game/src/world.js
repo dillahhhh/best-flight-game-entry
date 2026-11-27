@@ -1,694 +1,525 @@
-// SUNSET STRAIT — world.js
-// The strait: two islands, a sea, a coastal city, a runway and six glowing
-// rings. All geometry is seeded and deterministic. Rendering is a
-// painter's-algorithm projection of quads through the camera in math3d.js.
+// world.js — builds the Ember Strait in three.js from terrain.js.
+// Terrain mesh, sea, volcano smoke, harbour town, pine forests, cumulus
+// clouds, a 7-phase sky dome, stars, runways and glowing rings.
 
-// ---- layout (metres; north = -Z, sea level y = 0) ----
-const WORLD = {
-  seed: 20261126,
-  // West island (the coast you fly along), centre + radius + peak height.
-  westIsland: { x: -1500, z: 700, r: 1600, h: 210 },
-  // North island (runway + city), centre + radius + peak height.
-  northIsland: { x: 500, z: -3700, r: 1350, h: 130 },
-  runway: { x: 150, z: -3400, len: 720, wid: 48, heading: 0 }, // heading 0 = north-south
-  city: { x0: 380, x1: 1150, z0: -4050, z1: -3150 },
-  // Rings along the coastal route, from the start to the runway.
-  rings: [
-    { x: -40, y: 150, z: 1500, r: 55 },
-    { x: 120, y: 190, z: 650, r: 55 },
-    { x: -90, y: 230, z: -200, r: 55 },
-    { x: 80, y: 260, z: -1050, r: 55 },
-    { x: -60, y: 240, z: -1900, r: 55 },
-    { x: 140, y: 180, z: -2700, r: 55 },
-  ],
-  start: { x: 0, y: 200, z: 2500, yaw: 0, speed: 55 },
-  lighthouse: { x: -420, z: 2450 },
-  // Wind: from the west (270 deg) at 8 kt — pushes the plane east, drifts
-  // the clouds, and shows on the HUD wind chip. x/z are m/s in world space.
-  wind: { fromDeg: 270, speedKt: 8, x: 4.115, z: 0 },
+import * as THREE from 'three';
+import { terrainHeight, terrainTint, AIRFIELDS, WORLD_SIZE, EMBER_ARCH } from './terrain.js';
+
+const SKY_PHASES = {
+  dawn: { sky: 0x8a6f8e, fog: 0x9a7f8e, sun: 0xffb37a, sunI: 1.6, hemi: 0.55, stars: 0.25, amb: 0x8a7a90 },
+  morning: { sky: 0x7fb4dd, fog: 0x9cc3de, sun: 0xfff2cf, sunI: 2.4, hemi: 0.8, stars: 0, amb: 0xaac4de },
+  noon: { sky: 0x5ea9e6, fog: 0xa8cbe8, sun: 0xffffff, sunI: 2.8, hemi: 0.95, stars: 0, amb: 0xbfd8ee },
+  afternoon: { sky: 0x6fa8d8, fog: 0xa9c4d8, sun: 0xffe9b0, sunI: 2.5, hemi: 0.85, stars: 0, amb: 0xb8c8d8 },
+  golden: { sky: 0xe8965a, fog: 0xe8a06a, sun: 0xff9a3d, sunI: 2.5, hemi: 0.75, stars: 0.05, amb: 0xd89a6a },
+  dusk: { sky: 0x4a3a6e, fog: 0x6a5578, sun: 0xff7a4d, sunI: 1.6, hemi: 0.55, stars: 0.45, amb: 0x6a5a7a },
+  night: { sky: 0x0a1026, fog: 0x141a33, sun: 0x8fa8ff, sunI: 0.5, hemi: 0.22, stars: 1, amb: 0x2a3455 },
 };
+export const PHASE_ORDER = ['dawn', 'morning', 'noon', 'afternoon', 'golden', 'dusk', 'night'];
 
-function buildWorld() {
-  const noise = makeNoise(WORLD.seed);
-  const noise2 = makeNoise(WORLD.seed + 77);
+function lerpColor(a, b, t) {
+  return new THREE.Color(a).lerp(new THREE.Color(b), t);
+}
 
-  function islandH(cx, cz, ix, iz, ir, ih) {
-    const dx = (cx - ix) / ir, dz = (cz - iz) / ir;
-    const d = Math.sqrt(dx * dx + dz * dz);
-    if (d >= 1) return 0;
-    const fall = Math.pow(Math.cos(d * Math.PI * 0.5), 1.4);
-    const n = noise2(cx * 0.0016 + 7.3, cz * 0.0016 + 2.9) * 0.5 + 0.5;
-    const n2 = noise2(cx * 0.006 + 1.1, cz * 0.006 + 8.4) * 0.5 + 0.5;
-    return ih * fall * (0.45 + 0.55 * n) * (0.8 + 0.2 * n2);
-  }
+export function buildWorld(scene) {
+  const world = { rings: [], ringMeshes: [], clouds: [], smoke: null, beacons: [], cityLights: null, stars: null, sun: null, hemi: null, skyDome: null };
+  scene.fog = new THREE.Fog(0x9cc3de, 900, 5200);
 
-  // Flatten the ground under the runway, the city apron and a wide, flat
-  // approach corridor, so a landing is about lineup, not dodging hills.
-  // The flat patch runs well past both runway ends so a long landing is safe.
-  function flatten(x, z, h) {
-    const rw = WORLD.runway;
-    const lx = Math.abs(x - rw.x), lz = Math.abs(z - rw.z);
-    const halfX = rw.wid * 6, halfZ = rw.len / 2 + 320;
-    if (lx < halfX && lz < halfZ) {
-      const edge = Math.max(lx / halfX, lz / halfZ);
-      return h * Math.pow(clamp((edge - 0.45) / 0.55, 0, 1), 1.5);
-    }
-    const c = WORLD.city;
-    if (x > c.x0 - 80 && x < c.x1 + 80 && z > c.z0 - 80 && z < c.z1 + 80) {
-      return Math.min(h, 14);
-    }
-    return h;
-  }
+  // --- Sky dome: big inverted sphere, vertex colours fade horizon->zenith.
+  const skyGeo = new THREE.SphereGeometry(4800, 24, 14);
+  const skyMat = new THREE.MeshBasicMaterial({ side: THREE.BackSide, vertexColors: true, fog: false });
+  const pos = skyGeo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  skyGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  world.skyDome = new THREE.Mesh(skyGeo, skyMat);
+  scene.add(world.skyDome);
 
-  function groundHeight(x, z) {
-    let h = 0;
-    h += islandH(x, z, WORLD.westIsland.x, WORLD.westIsland.z, WORLD.westIsland.r, WORLD.westIsland.h);
-    h += islandH(x, z, WORLD.northIsland.x, WORLD.northIsland.z, WORLD.northIsland.r, WORLD.northIsland.h);
-    // A low rocky point for the lighthouse, south tip of the west island.
-    const ldx = (x - WORLD.lighthouse.x) / 260, ldz = (z - WORLD.lighthouse.z) / 260;
-    const ld = Math.sqrt(ldx * ldx + ldz * ldz);
-    if (ld < 1) h += 26 * Math.pow(Math.cos(ld * Math.PI * 0.5), 1.2);
-    return flatten(x, z, h);
-  }
-
-  // ---- terrain grid (precomputed vertices + quads) ----
-  const GX0 = -3200, GX1 = 2300, GZ0 = -5200, GZ1 = 3000, CELL = 80;
-  const NX = Math.round((GX1 - GX0) / CELL), NZ = Math.round((GZ1 - GZ0) / CELL);
-  const verts = new Float32Array((NX + 1) * (NZ + 1) * 3);
-  for (let j = 0; j <= NZ; j++) {
-    for (let i = 0; i <= NX; i++) {
-      const x = GX0 + i * CELL, z = GZ0 + j * CELL;
-      const k = (j * (NX + 1) + i) * 3;
-      verts[k] = x; verts[k + 1] = groundHeight(x, z); verts[k + 2] = z;
-    }
-  }
-  // Sun low ahead-left on the northbound route (in frame from the chase cam).
-  const SUN = { x: -0.42, y: 0.16, z: -0.89 };
-  // Per-quad colour: a smooth height ramp (sand -> grass -> forest -> rock)
-  // with a fixed sun shade and a touch of per-quad tint so the ground reads
-  // as terrain, not a patchwork.
-  function quadColor(h, nx, nz, jit) {
-    const stops = [
-      [0, 216, 178, 128], [6, 150, 158, 92], [40, 96, 125, 66],
-      [110, 58, 92, 46], [170, 122, 106, 88], [260, 122, 106, 88],
-    ];
-    let r = 122, g = 106, b = 88;
-    for (let s = 0; s < stops.length - 1; s++) {
-      const a = stops[s], c = stops[s + 1];
-      if (h >= a[0] && h <= c[0]) {
-        const t = (h - a[0]) / (c[0] - a[0] || 1);
-        r = lerp(a[1], c[1], t); g = lerp(a[2], c[2], t); b = lerp(a[3], c[3], t);
-        break;
-      }
-    }
-    const shade = 0.90 + 0.10 * clamp(nx * SUN.x + nz * SUN.z + 0.4, 0, 1);
-    const tint = 0.90 + jit * 0.20;
-    return `rgb(${r * shade * tint | 0},${g * shade * tint | 0},${b * shade * tint | 0})`;
-  }
-  const quads = [];
-  for (let j = 0; j < NZ; j++) {
-    for (let i = 0; i < NX; i++) {
-      const a = j * (NX + 1) + i, b = a + 1, c = a + NX + 1, d = c + 1;
-      const h = (verts[a * 3 + 1] + verts[b * 3 + 1] + verts[c * 3 + 1] + verts[d * 3 + 1]) * 0.25;
-      if (h < 1.2) continue; // sea, not land
-      const cx = (verts[a * 3] + verts[d * 3]) * 0.5;
-      const cz = (verts[a * 3 + 2] + verts[d * 3 + 2]) * 0.5;
-      // Cheap normal from the diagonal.
-      const nx = verts[d * 3 + 1] - verts[a * 3 + 1], nz = verts[c * 3 + 1] - verts[b * 3 + 1];
-      const nl = Math.hypot(nx, nz) || 1;
-      const jit = noise2(cx * 0.02 + 3.7, cz * 0.02 + 9.1) * 0.5 + 0.5;
-      quads.push({ v: [a, b, d, c], cx, cz, h, color: quadColor(h, nx / nl, nz / nl, jit) });
-    }
-  }
-
-  // ---- city: seeded boxes on the flat apron ----
-  const rand = mulberry32(WORLD.seed + 5);
-  const buildings = [];
-  const c = WORLD.city;
-  for (let n = 0; n < 52; n++) {
-    const bx = c.x0 + rand() * (c.x1 - c.x0);
-    const bz = c.z0 + rand() * (c.z1 - c.z0);
-    // Keep the runway strip clear.
-    if (Math.abs(bx - WORLD.runway.x) < 120 && Math.abs(bz - WORLD.runway.z) < 420) continue;
-    const w = 22 + rand() * 34, d = 22 + rand() * 34;
-    const h = 10 + rand() * rand() * 46;
-    const warm = 150 + rand() * 60 | 0;
-    buildings.push({
-      x: bx, z: bz, w, d, h, y: groundHeight(bx, bz),
-      color: `rgb(${warm},${warm - 28 | 0},${warm - 66 | 0})`,
-      top: `rgb(${warm + 18},${warm - 8 | 0},${warm - 40 | 0})`,
-      floors: 1 + (h / 7 | 0),
-    });
-  }
-
-  // ---- clouds: soft puffs high over the strait ----
-  const clouds = [];
-  for (let n = 0; n < 16; n++) {
-    clouds.push({
-      x: -2600 + rand() * 5200,
-      y: 520 + rand() * 320,
-      z: -4800 + rand() * 7400,
-      s: 180 + rand() * 260,
-      a: 0.10 + rand() * 0.16,
-    });
-  }
-
-  // ---- ground decals: fields, a coastal road and a river ----
-  // Flat quads laid on the terrain (height + 0.8) so the islands read as
-  // farmland, roads and water, not bare heightfield. All seeded, fixed.
-  const decals = [];
-  const fieldColors = ['#c9a86a', '#7da05c', '#8a9a52', '#b59a6a', '#6f9a4e', '#d0b578'];
-  function addField(cx, cz, w, d, rot) {
-    const pts = [];
-    for (const [lx, lz] of [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]]) {
-      const c = Math.cos(rot), s = Math.sin(rot);
-      const x = cx + lx * c - lz * s, z = cz + lx * s + lz * c;
-      pts.push([x, groundHeight(x, z) + 0.8, z]);
-    }
-    if (pts.some((p) => p[1] < 3 || p[1] > 130)) return;
-    decals.push({ pts, fill: fieldColors[(rand() * fieldColors.length) | 0] });
-  }
-  // Farm patches on the west island lowlands and the north island apron.
-  for (let n = 0; n < 26; n++) {
-    const cx = -2600 + rand() * 2400, cz = -800 + rand() * 3400;
-    addField(cx, cz, 120 + rand() * 220, 90 + rand() * 180, rand() * Math.PI);
-  }
-  for (let n = 0; n < 10; n++) {
-    const cx = -200 + rand() * 1500, cz = -4400 + rand() * 1100;
-    addField(cx, cz, 110 + rand() * 180, 80 + rand() * 150, rand() * Math.PI);
-  }
-  // Coastal road: a chain of quads hugging the west coast, south to north.
-  const roadPts = [];
-  for (let z = 2800; z >= -1600; z -= 220) {
-    roadPts.push([-560 + Math.sin(z * 0.0009) * 260, z]);
-  }
-  for (let i = 0; i < roadPts.length - 1; i++) {
-    const [x0, z0] = roadPts[i], [x1, z1] = roadPts[i + 1];
-    const dx = x1 - x0, dz = z1 - z0, len = Math.hypot(dx, dz) || 1;
-    const px = (-dz / len) * 7, pz = (dx / len) * 7;
-    decals.push({
-      pts: [
-        [x0 - px, groundHeight(x0 - px, z0 - pz) + 0.8, z0 - pz],
-        [x0 + px, groundHeight(x0 + px, z0 + pz) + 0.8, z0 + pz],
-        [x1 + px, groundHeight(x1 + px, z1 + pz) + 0.8, z1 + pz],
-        [x1 - px, groundHeight(x1 - px, z1 - pz) + 0.8, z1 - pz],
-      ],
-      fill: '#5c5148',
-    });
-  }
-  // River: a blue ribbon winding down the west island into the strait.
-  const riverPts = [];
-  for (let t = 0; t <= 1.0001; t += 0.1) {
-    riverPts.push([-1900 + t * 1150 + Math.sin(t * 9) * 130, 1500 - t * 1900]);
-  }
-  for (let i = 0; i < riverPts.length - 1; i++) {
-    const [x0, z0] = riverPts[i], [x1, z1] = riverPts[i + 1];
-    const dx = x1 - x0, dz = z1 - z0, len = Math.hypot(dx, dz) || 1;
-    const px = (-dz / len) * 16, pz = (dx / len) * 16;
-    const p = (x, z) => [x, Math.max(groundHeight(x, z), 2.5) + 0.6, z];
-    decals.push({ pts: [p(x0 - px, z0 - pz), p(x0 + px, z0 + pz), p(x1 + px, z1 + pz), p(x1 - px, z1 - pz)], fill: '#2e7fa8' });
-  }
-
-  // ---- per-frame scratch: flat projection arrays, zero allocation ----
-  // Terrain vertices project into these typed arrays (x, y, depth, scale
-  // per vertex); buildings, rings and decals get their own scratch below.
-  const NV = (NX + 1) * (NZ + 1);
-  const projX = new Float32Array(NV), projY = new Float32Array(NV);
-  const projD = new Float32Array(NV), projS = new Float32Array(NV);
-  const projOk = new Uint8Array(NV);
-  const bProj = new Float32Array(buildings.length * 8 * 4);
-  const bOk = new Uint8Array(buildings.length * 8);
-  const ringProj = new Float32Array(6 * 29 * 4);
-  const ringOk = new Uint8Array(6 * 29);
-  const decalProj = new Float32Array(Math.max(1, decals.length) * 4 * 4);
-  const decalOk = new Uint8Array(Math.max(1, decals.length) * 4);
-  // Pooled draw items, one object per quad/building/decal, reused every
-  // frame: {d, kind, a, b, c, e, fill} — kind 0 = terrain quad (a..e are
-  // vertex indices), 1 = building (a = building index), 2 = decal (a = decal index).
-  const itemPool = [];
-  for (let i = 0; i < quads.length; i++) itemPool.push({ d: 0, kind: 0, a: 0, b: 0, c: 0, e: 0, fill: '' });
-  for (let i = 0; i < buildings.length; i++) itemPool.push({ d: 0, kind: 1, a: 0, b: 0, c: 0, e: 0, fill: '' });
-  for (let i = 0; i < decals.length; i++) itemPool.push({ d: 0, kind: 2, a: 0, b: 0, c: 0, e: 0, fill: '' });
-  const items = itemPool.slice();
-  // drawOrder: indices into items, sorted far-to-near each frame. The pool
-  // array itself is never truncated or re-sorted, so its objects survive.
-  const drawOrder = new Int32Array(items.length);
-
-  return {
-    groundHeight, verts, NX, NZ, quads, buildings, clouds, decals,
-    sunDir: SUN, rings: WORLD.rings, runway: WORLD.runway, lighthouse: WORLD.lighthouse,
-    wind: WORLD.wind,
-    projX, projY, projD, projS, projOk, bProj, bOk, ringProj, ringOk, decalProj, decalOk,
-    itemPool, items, drawOrder, nItems: 0,
+  // --- Terrain: 256x256 grid, vertex colours by height tint + mottling.
+  // The palette is deliberately FLAT and calm — big quiet colour fields,
+  // not high-frequency noise: Tidewing proves a plain lime field reads
+  // cleaner in a 300 px thumbnail than dense mottling. Colour changes
+  // happen at broad scale (120 m cells); the fine mottle is only ±4%,
+  // enough to kill banding, too small to read as texture.
+  const SEG = 256;
+  const tg = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, SEG, SEG);
+  tg.rotateX(-Math.PI / 2);
+  const tp = tg.attributes.position;
+  const tc = new Float32Array(tp.count * 3);
+  const SAND = new THREE.Color(0xd9c08a), SAND_L = new THREE.Color(0xe8d6a8),
+    GRASS_A = new THREE.Color(0x58a647), GRASS_B = new THREE.Color(0x478c3a),
+    GRASS_C = new THREE.Color(0x6fb04e), ROCK = new THREE.Color(0x8a7a68),
+    ROCK_D = new THREE.Color(0x6a5f52), ASH = new THREE.Color(0x5f574c),
+    ASH_D = new THREE.Color(0x3d362e);
+  const CROPS = [0xc9a86a, 0x7a8a3a, 0x3f7a34, 0x8a6a44, 0x86b04a, 0xa8b858].map((h) => new THREE.Color(h));
+  const c = new THREE.Color(), c2 = new THREE.Color();
+  const hash2 = (x, z) => {
+    const s = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+    return s - Math.floor(s);
   };
-}
-
-// ---- drawing helpers (all take ctx + camera) ----
-function drawPoly(ctx, pts, fill) {
-  ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-  ctx.closePath();
-  ctx.fillStyle = fill;
-  ctx.fill();
-}
-
-// Project the terrain's shared vertices once per frame into flat typed
-// arrays — no object per vertex, no allocation at all.
-const _tmpPt = { x: 0, y: 0, d: 0, s: 0 };
-function projectTerrain(world, cam) {
-  const v = world.verts, n = v.length / 3;
-  const px = world.projX, py = world.projY, pd = world.projD, ps = world.projS, ok = world.projOk;
-  for (let i = 0; i < n; i++) {
-    if (cam.projectInto(v[i * 3], v[i * 3 + 1], v[i * 3 + 2], _tmpPt)) {
-      px[i] = _tmpPt.x; py[i] = _tmpPt.y; pd[i] = _tmpPt.d; ps[i] = _tmpPt.s; ok[i] = 1;
-    } else ok[i] = 0;
-  }
-}
-
-// Fill world.items[0..n) with the visible terrain quads, buildings and
-// decals for this frame (pooled objects, no allocation), sorted far-to-near
-// by the caller. Returns the count.
-function collectDrawItems(world, cam) {
-  const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
-  const px = world.projX, py = world.projY, pd = world.projD, ok = world.projOk;
-  const items = world.items;
-  let n = 0;
-  for (let qi = 0; qi < world.quads.length; qi++) {
-    const q = world.quads[qi];
-    const dx = q.cx - cam.x, dz = q.cz - cam.z;
-    const dist2 = dx * dx + dz * dz;
-    if (dist2 > 2600 * 2600) continue;
-    if (dx * fx + dz * fz < -200) continue; // behind the camera
-    const v0 = q.v[0], v1 = q.v[1], v2 = q.v[2], v3 = q.v[3];
-    if (!ok[v0] || !ok[v1] || !ok[v2] || !ok[v3]) continue;
-    const it = items[n++];
-    it.d = (pd[v0] + pd[v1] + pd[v2] + pd[v3]) * 0.25;
-    it.kind = 0; it.a = v0; it.b = v1; it.c = v2; it.e = v3; it.fill = q.color;
-  }
-  // Buildings: project 8 corners into scratch, keep the item for the sort.
-  for (let bi = 0; bi < world.buildings.length; bi++) {
-    const b = world.buildings[bi];
-    const dx = b.x - cam.x, dz = b.z - cam.z;
-    if (dx * dx + dz * dz > 3000 * 3000) continue;
-    const hw = b.w / 2, hd = b.d / 2, top = b.y + b.h;
-    const baseY = b.y - 15;
-    const corners = [
-      [b.x - hw, baseY, b.z - hd], [b.x + hw, baseY, b.z - hd],
-      [b.x + hw, baseY, b.z + hd], [b.x - hw, baseY, b.z + hd],
-      [b.x - hw, top, b.z - hd], [b.x + hw, top, b.z - hd],
-      [b.x + hw, top, b.z + hd], [b.x - hw, top, b.z + hd],
-    ];
-    let any = false, depth = 0;
-    for (let k = 0; k < 8; k++) {
-      const o = bi * 8 + k;
-      if (cam.projectInto(corners[k][0], corners[k][1], corners[k][2], _tmpPt)) {
-        world.bProj[o * 4] = _tmpPt.x; world.bProj[o * 4 + 1] = _tmpPt.y;
-        world.bProj[o * 4 + 2] = _tmpPt.d; world.bProj[o * 4 + 3] = _tmpPt.s;
-        world.bOk[o] = 1; any = true; depth += _tmpPt.d;
-      } else world.bOk[o] = 0;
+  for (let i = 0; i < tp.count; i++) {
+    const x = tp.getX(i), z = tp.getZ(i);
+    const h = terrainHeight(x, z);
+    tp.setY(i, h);
+    const t = terrainTint(x, z, h);
+    c.copy(t === 0 ? SAND : t === 1 ? GRASS_A : t === 2 ? ROCK : ASH);
+    // Broad colour fields: the green blend changes at 120 m cells, so a
+    // hillside reads as one calm field, not speckle. The fine mottle is
+    // only ±4% — it kills banding without reading as texture.
+    const m1 = hash2(Math.floor(x / 34), Math.floor(z / 34));
+    const m2 = hash2(Math.floor(x / 120) + 40, Math.floor(z / 120) + 40);
+    const mottle = 0.96 + (m1 - 0.5) * 0.08;
+    if (t === 1) {
+      // Blend between two greens by the coarse noise cell.
+      c2.copy(m2 > 0.5 ? GRASS_C : GRASS_A);
+      c.lerp(c2, 0.4);
+    } else if (t === 0) {
+      c.lerp(SAND_L, m1 * 0.5);
+    } else if (t === 2) {
+      c.lerp(ROCK_D, m1 * 0.4);
     }
-    if (!any) continue;
-    const it = items[n++];
-    it.d = depth / 8; it.kind = 1; it.a = bi;
-  }
-  // Decals (fields / road / river): project 4 corners into scratch.
-  for (let di = 0; di < world.decals.length; di++) {
-    const dc = world.decals[di];
-    const cx = (dc.pts[0][0] + dc.pts[2][0]) * 0.5, cz = (dc.pts[0][2] + dc.pts[2][2]) * 0.5;
-    const dx = cx - cam.x, dz = cz - cam.z;
-    if (dx * dx + dz * dz > 2600 * 2600) continue;
-    if (dx * fx + dz * fz < -200) continue;
-    let any = false, depth = 0;
-    for (let k = 0; k < 4; k++) {
-      const o = di * 4 + k;
-      if (cam.projectInto(dc.pts[k][0], dc.pts[k][1], dc.pts[k][2], _tmpPt)) {
-        world.decalProj[o * 4] = _tmpPt.x; world.decalProj[o * 4 + 1] = _tmpPt.y;
-        world.decalProj[o * 4 + 2] = _tmpPt.d; world.decalProj[o * 4 + 3] = _tmpPt.s;
-        world.decalOk[o] = 1; any = true; depth += _tmpPt.d;
-      } else world.decalOk[o] = 0;
+    // Patchwork crop fields on Lumen's lower slopes (not town, not runway):
+    // BIG cells (280 m), only three colours — calm blocks, not confetti.
+    const inFields = h > 12 && h < 130 && Math.abs(x) < 950 && z > -150 && z < 1450
+      && !(x > -320 && x < 320 && z > 900 && z < 1350) // town
+      && !(Math.abs(x) < 70 && z > 150 && z < 1100); // runway strip
+    if (inFields) {
+      const cell = hash2(Math.floor(x / 280), Math.floor(z / 280));
+      if (cell > 0.35) c.lerp(CROPS[[0, 2, 5][Math.floor(cell * 3) % 3]], 0.7);
     }
-    if (!any) continue;
-    const it = items[n++];
-    it.d = depth / 4; it.kind = 2; it.a = di;
+    // Ash streaks radiating down Bara's flanks: broad and few, so the
+    // cone reads as one dark solid silhouette.
+    const dxB = x + 1500, dzB = z + 1150;
+    const dB = Math.sqrt(dxB * dxB + dzB * dzB);
+    if (dB < 1000 && h > 140) {
+      const ang = Math.atan2(dzB, dxB);
+      const streak = 0.5 + 0.5 * Math.sin(ang * 4 + dB * 0.01);
+      if (streak > 0.6) c.lerp(ASH_D, Math.min(0.6, (1 - dB / 1000) * 0.8));
+    }
+    c.multiplyScalar(mottle);
+    tc[i * 3] = c.r; tc[i * 3 + 1] = c.g; tc[i * 3 + 2] = c.b;
   }
-  world.nItems = n;
-  // Index order for the painter's sort (the pool itself stays untouched).
-  const order = world.drawOrder;
-  for (let i = 0; i < n; i++) order[i] = i;
-  return n;
-}
+  tg.setAttribute('color', new THREE.BufferAttribute(tc, 3));
+  tg.computeVertexNormals();
+  const terrain = new THREE.Mesh(tg, new THREE.MeshLambertMaterial({ vertexColors: true }));
+  scene.add(terrain);
 
-// Draw one pooled item (kind 0 = terrain quad from flat arrays,
-// 1 = building from bProj scratch, 2 = decal from decalProj scratch).
-function drawItem(ctx, world, cam, it) {
-  if (it.kind === 0) {
-    const px = world.projX, py = world.projY;
-    ctx.beginPath();
-    ctx.moveTo(px[it.a], py[it.a]);
-    ctx.lineTo(px[it.b], py[it.b]);
-    ctx.lineTo(px[it.c], py[it.c]);
-    ctx.lineTo(px[it.e], py[it.e]);
-    ctx.closePath();
-    ctx.fillStyle = it.fill;
-    ctx.fill();
-  } else if (it.kind === 2) {
-    const dp = world.decalProj, ok = world.decalOk, o = it.a * 4;
-    if (!ok[o] || !ok[o + 1] || !ok[o + 2] || !ok[o + 3]) return;
-    ctx.beginPath();
-    ctx.moveTo(dp[o * 4], dp[o * 4 + 1]);
-    ctx.lineTo(dp[(o + 1) * 4], dp[(o + 1) * 4 + 1]);
-    ctx.lineTo(dp[(o + 2) * 4], dp[(o + 2) * 4 + 1]);
-    ctx.lineTo(dp[(o + 3) * 4], dp[(o + 3) * 4 + 1]);
-    ctx.closePath();
-    ctx.fillStyle = world.decals[it.a].fill;
-    ctx.fill();
-  } else {
-    drawBuildingItem(ctx, world, cam, it.a);
+  // --- Sea: translucent plane just above water level, gentle opacity.
+  const sea = new THREE.Mesh(
+    new THREE.PlaneGeometry(WORLD_SIZE * 1.6, WORLD_SIZE * 1.6),
+    new THREE.MeshLambertMaterial({ color: 0x1d6f9e, transparent: true, opacity: 0.82 }),
+  );
+  sea.rotation.x = -Math.PI / 2;
+  sea.position.y = 2;
+  scene.add(sea);
+
+  // --- Shallow-water halo: a turquoise disc hugging each main island's
+  // coast. It sits at y = 2.2 — above the sea, below the beach — so it
+  // shows exactly where the water is shallow and vanishes under the
+  // land, tracing the real coastline in a pale turquoise ring.
+  const shallowMat = new THREE.MeshLambertMaterial({ color: 0x3fc4c4, transparent: true, opacity: 0.5 });
+  for (const [cx, cz, r] of [[-1500, -1150, 1150], [0, 620, 1350], [1420, -560, 950], [980, 1560, 800], [EMBER_ARCH.x, EMBER_ARCH.z, 170]]) {
+    const halo = new THREE.Mesh(new THREE.CircleGeometry(r, 48), shallowMat);
+    halo.rotation.x = -Math.PI / 2;
+    halo.position.set(cx, 2.2, cz);
+    scene.add(halo);
   }
-}
 
-// Flat quad path from a scratch projection array (no point objects).
-function drawQuadFlat(ctx, arr, base, i0, i1, i2, i3, fill) {
-  ctx.beginPath();
-  ctx.moveTo(arr[(base + i0) * 4], arr[(base + i0) * 4 + 1]);
-  ctx.lineTo(arr[(base + i1) * 4], arr[(base + i1) * 4 + 1]);
-  ctx.lineTo(arr[(base + i2) * 4], arr[(base + i2) * 4 + 1]);
-  ctx.lineTo(arr[(base + i3) * 4], arr[(base + i3) * 4 + 1]);
-  ctx.closePath();
-  ctx.fillStyle = fill;
-  ctx.fill();
-}
+  // --- Lights.
+  world.sun = new THREE.DirectionalLight(0xfff2cf, 2.4);
+  world.sun.position.set(1200, 1600, 600);
+  scene.add(world.sun);
+  scene.add(new THREE.AmbientLight(0xaac4de, 0.5));
+  world.hemi = new THREE.HemisphereLight(0xbfd8ee, 0x3a5a3a, 0.8);
+  scene.add(world.hemi);
 
-function drawBuildingItem(ctx, world, cam, bi) {
-  const b = world.buildings[bi];
-  const bp = world.bProj, ok = world.bOk, base = bi * 8;
-  for (let k = 0; k < 8; k++) if (!ok[base + k]) return;
-  const X = (k) => bp[(base + k) * 4], Y = (k) => bp[(base + k) * 4 + 1];
-  // Roof.
-  drawQuadFlat(ctx, bp, base, 4, 5, 6, 7, b.top);
-  // Two camera-facing walls: pick by which side the camera is on.
-  const faces = [];
-  if (cam.z > b.z + b.d / 2) faces.push([2, 3, 7, 6]); // south wall
-  else if (cam.z < b.z - b.d / 2) faces.push([0, 1, 5, 4]); // north wall
-  if (cam.x > b.x + b.w / 2) faces.push([1, 2, 6, 5]); // east wall
-  else if (cam.x < b.x - b.w / 2) faces.push([3, 0, 4, 7]); // west wall
-  for (const f of faces) drawQuadFlat(ctx, bp, base, f[0], f[1], f[2], f[3], b.color);
-  // Lit windows on the walls: a few warm dots.
-  ctx.fillStyle = '#ffd98a';
-  for (const f of faces) {
-    const rows = Math.max(1, Math.min(4, b.floors));
-    for (let rI = 0; rI < rows; rI++) {
-      for (let cI = 0; cI < 3; cI++) {
-        const u = 0.2 + cI * 0.3, v = 0.25 + rI * (0.6 / rows);
-        const ix = X(f[0]) * (1 - u) * (1 - v) + X(f[1]) * u * (1 - v) + X(f[2]) * u * v + X(f[3]) * (1 - u) * v;
-        const iy = Y(f[0]) * (1 - u) * (1 - v) + Y(f[1]) * u * (1 - v) + Y(f[2]) * u * v + Y(f[3]) * (1 - u) * v;
-        if (((rI * 3 + cI + b.x) % 3) !== 0) continue;
-        ctx.fillRect(ix - 1.5, iy - 1.5, 3, 3);
+  // --- Stars: points on the dome, faded in at night. Round sprite so
+  // they read as stars, not square pixels.
+  const starCanvas = document.createElement('canvas');
+  starCanvas.width = 32; starCanvas.height = 32;
+  const sctx = starCanvas.getContext('2d');
+  const grad = sctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.4, 'rgba(255,255,255,0.7)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  sctx.fillStyle = grad;
+  sctx.fillRect(0, 0, 32, 32);
+  const starTex = new THREE.CanvasTexture(starCanvas);
+  const starGeo = new THREE.BufferGeometry();
+  const starPos = [];
+  for (let i = 0; i < 900; i++) {
+    const a = Math.random() * Math.PI * 2, e = Math.random() * Math.PI * 0.42 + 0.08;
+    starPos.push(Math.cos(a) * Math.cos(e) * 4600, Math.sin(e) * 4600, Math.sin(a) * Math.cos(e) * 4600);
+  }
+  starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPos, 3));
+  world.stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 14, sizeAttenuation: false, map: starTex, transparent: true, opacity: 0, fog: false, depthWrite: false }));
+  scene.add(world.stars);
+
+  // --- Volcano smoke: a short, compact white plume on the dark cone —
+  // a bright vertical accent, not a long grey bead string. Nine big
+  // overlapping puffs, tight column, high opacity, so it reads as one
+  // solid plume against the blue sky.
+  const smokeGroup = new THREE.Group();
+  const smokeCols = [0xd8d2c8, 0xcfc9c0, 0xc4beb4];
+  for (let i = 0; i < 9; i++) {
+    const r = 26 + i * 4 + Math.random() * 8;
+    const s = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8),
+      new THREE.MeshLambertMaterial({ color: smokeCols[i % smokeCols.length], transparent: true, opacity: 0.8 }));
+    s.position.set(-1500 + (Math.random() * 2 - 1) * (14 + i * 4) + i * 5, 450 + i * 24, -1150 + (Math.random() * 2 - 1) * (12 + i * 4) - i * 3);
+    s.scale.set(1.3, 0.75, 1.15);
+    smokeGroup.add(s);
+  }
+  world.smoke = smokeGroup;
+  scene.add(smokeGroup);
+  // Lava glow in the crater: wide emissive disc + orange point light.
+  const lava = new THREE.Mesh(new THREE.CircleGeometry(72, 20),
+    new THREE.MeshBasicMaterial({ color: 0xff5a1a, fog: false }));
+  lava.rotation.x = -Math.PI / 2;
+  lava.position.set(-1500, 302, -1150);
+  scene.add(lava);
+  const lavaLight = new THREE.PointLight(0xff6a2a, 900, 1100, 1.6);
+  lavaLight.position.set(-1500, 340, -1150);
+  scene.add(lavaLight);
+
+  // --- Pine forests: FEW and SPACED, so every tree reads on its own —
+  // Tidewing's trees are sparse simple cones with gaps between them, not
+  // a dense dark mass. 750 trees in separated stands, bigger, crisper
+  // 8-sided cones, brighter greens.
+  const treeSpots = [];
+  let tries = 0;
+  while (treeSpots.length < 750 && tries < 30000) {
+    tries++;
+    const x = (Math.random() * 2 - 1) * 2800, z = (Math.random() * 2 - 1) * 2800;
+    const h = terrainHeight(x, z);
+    if (h < 12 || h > 150) continue;
+    if (Math.abs(x) < 260 && Math.abs(z - 620) < 480) continue; // keep town clear
+    if (Math.abs(x) < 70 && z > 150 && z < 1100) continue; // keep runway clear
+    // Clump gate: only where the low-frequency stand noise is high —
+    // a high gate leaves wide gaps between stands.
+    const cl = Math.sin(x * 0.004 + 1.7) * Math.sin(z * 0.004 + 0.6)
+      + 0.5 * Math.sin(x * 0.011 + 4.2) * Math.sin(z * 0.011 + 2.1);
+    if (cl < 0.15) continue;
+    treeSpots.push([x, h, z]);
+  }
+  const cone = new THREE.ConeGeometry(7, 26, 8);
+  const coneMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const cones = new THREE.InstancedMesh(cone, coneMat, treeSpots.length);
+  const trunkGeo = new THREE.CylinderGeometry(1.1, 1.5, 9, 5);
+  const trunkMat = new THREE.MeshLambertMaterial({ color: 0x6a4a2e });
+  const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeSpots.length);
+  const m4 = new THREE.Matrix4();
+  const q4 = new THREE.Quaternion();
+  const v3 = new THREE.Vector3();
+  const s3 = new THREE.Vector3();
+  const treeGreens = [new THREE.Color(0x2f7a2e), new THREE.Color(0x3d8a37), new THREE.Color(0x63b84a), new THREE.Color(0x2a6e33)];
+  treeSpots.forEach(([x, h, z], i) => {
+    const s = 0.9 + Math.random() * 1.2;
+    m4.compose(v3.set(x, h + 13 * s, z), q4.identity(), s3.set(s, s, s));
+    cones.setMatrixAt(i, m4);
+    cones.setColorAt(i, treeGreens[i % treeGreens.length]);
+    m4.compose(v3.set(x, h + 4 * s, z), q4.identity(), s3.set(s, s, s));
+    trunks.setMatrixAt(i, m4);
+  });
+  cones.instanceColor.needsUpdate = true;
+  scene.add(cones);
+  scene.add(trunks);
+
+  // --- Boulders on the slopes + low bushes on the grass.
+  const rockGeo = new THREE.DodecahedronGeometry(6, 0);
+  const rockMat = new THREE.MeshLambertMaterial({ color: 0x8a8178 });
+  const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 180);
+  const eul = new THREE.Euler();
+  for (let i = 0; i < 180; i++) {
+    const x = (Math.random() * 2 - 1) * 2700, z = (Math.random() * 2 - 1) * 2700;
+    const h = terrainHeight(x, z);
+    if (h < 30 || h > 330) { rocks.setMatrixAt(i, m4.makeScale(0.001, 0.001, 0.001)); continue; }
+    const s = 0.6 + Math.random() * 1.8;
+    eul.set(Math.random() * 0.6, Math.random() * Math.PI, Math.random() * 0.6);
+    q4.setFromEuler(eul);
+    m4.compose(v3.set(x, h + 2 * s, z), q4, s3.set(s, s * 0.75, s));
+    rocks.setMatrixAt(i, m4);
+  }
+  scene.add(rocks);
+  const bushGeo = new THREE.SphereGeometry(4, 6, 5);
+  const bushMat = new THREE.MeshLambertMaterial({ color: 0x3a6e2f });
+  const bushes = new THREE.InstancedMesh(bushGeo, bushMat, 280);
+  for (let i = 0; i < 280; i++) {
+    const x = (Math.random() * 2 - 1) * 2700, z = (Math.random() * 2 - 1) * 2700;
+    const h = terrainHeight(x, z);
+    if (h < 10 || h > 160) { bushes.setMatrixAt(i, m4.makeScale(0.001, 0.001, 0.001)); continue; }
+    const s = 0.7 + Math.random() * 1.4;
+    m4.compose(v3.set(x, h + 1.5 * s, z), q4.identity(), s3.set(s, s * 0.6, s));
+    bushes.setMatrixAt(i, m4);
+  }
+  scene.add(bushes);
+
+  // --- Coastal road: a ribbon hugging Lumen's coast, following the
+  // terrain, so the home island reads as inhabited from the air.
+  {
+    const pts = [];
+    for (let a = 0; a < Math.PI * 2; a += Math.PI * 2 / 110) {
+      const x = 780 * Math.cos(a), z = 620 + 620 * Math.sin(a);
+      if (terrainHeight(x, z) < 9) continue;
+      pts.push([x, z]);
+    }
+    const posArr = [], idxArr = [];
+    pts.forEach(([x, z], i) => {
+      const [nx, nz] = pts[(i + 1) % pts.length];
+      const [px, pz] = pts[(i - 1 + pts.length) % pts.length];
+      let tx = nx - px, tz = nz - pz;
+      const tl = Math.hypot(tx, tz) || 1;
+      tx /= tl; tz /= tl;
+      const ox = -tz * 4.5, oz = tx * 4.5;
+      posArr.push(x - ox, terrainHeight(x - ox, z - oz) + 1.2, z - oz);
+      posArr.push(x + ox, terrainHeight(x + ox, z + oz) + 1.2, z + oz);
+      if (i > 0) {
+        const b = (i - 1) * 2;
+        idxArr.push(b, b + 1, b + 2, b + 1, b + 3, b + 2);
+      }
+    });
+    const rg = new THREE.BufferGeometry();
+    rg.setAttribute('position', new THREE.Float32BufferAttribute(posArr, 3));
+    rg.setIndex(idxArr);
+    rg.computeVertexNormals();
+    scene.add(new THREE.Mesh(rg, new THREE.MeshLambertMaterial({ color: 0x3d4148 })));
+  }
+
+  // --- Port Lumen town: boxes with warm emissive windows, plus a lighthouse.
+  const town = new THREE.Group();
+  const wallMat = new THREE.MeshLambertMaterial({ color: 0xe8dcc8 });
+  const roofMat = new THREE.MeshLambertMaterial({ color: 0xb0522e });
+  const winMat = new THREE.MeshBasicMaterial({ color: 0xffd27a });
+  for (let i = 0; i < 64; i++) {
+    const bx = -260 + (i % 8) * 62 + (Math.random() * 20 - 10);
+    const bz = 980 + Math.floor(i / 8) * 58 + (Math.random() * 16 - 8);
+    const h = terrainHeight(bx, bz);
+    if (h < 8) continue;
+    const w = 16 + Math.random() * 14, d = 14 + Math.random() * 12, ht = 10 + Math.random() * 22;
+    const house = new THREE.Mesh(new THREE.BoxGeometry(w, ht, d), wallMat);
+    house.position.set(bx, h + ht / 2, bz);
+    town.add(house);
+    const roof = new THREE.Mesh(new THREE.ConeGeometry(Math.max(w, d) * 0.75, 6, 4), roofMat);
+    roof.position.set(bx, h + ht + 3, bz);
+    roof.rotation.y = Math.PI / 4;
+    town.add(roof);
+    const win = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.5, 3), winMat);
+    win.position.set(bx, h + ht * 0.55, bz - d / 2 - 0.1);
+    win.rotation.y = Math.PI;
+    town.add(win);
+  }
+  // Lighthouse on the harbour point, striped tower + lamp.
+  const light = new THREE.Mesh(new THREE.CylinderGeometry(6, 9, 55, 10),
+    new THREE.MeshLambertMaterial({ color: 0xf2ede2 }));
+  light.position.set(-330, terrainHeight(-330, 420) + 27, 420);
+  town.add(light);
+  const lamp = new THREE.Mesh(new THREE.SphereGeometry(6, 10, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffe9a0 }));
+  lamp.position.set(-330, terrainHeight(-330, 420) + 58, 420);
+  town.add(lamp);
+  // Hijau hamlet: a dozen small houses by the Hijau Strip.
+  for (let i = 0; i < 12; i++) {
+    const bx = 1180 + (i % 4) * 55 + (Math.random() * 16 - 8);
+    const bz = -420 + Math.floor(i / 4) * 48 + (Math.random() * 12 - 6);
+    const h = terrainHeight(bx, bz);
+    if (h < 8) continue;
+    const w = 12 + Math.random() * 8, d = 11 + Math.random() * 8, ht = 8 + Math.random() * 10;
+    const house = new THREE.Mesh(new THREE.BoxGeometry(w, ht, d), wallMat);
+    house.position.set(bx, h + ht / 2, bz);
+    town.add(house);
+    const roof = new THREE.Mesh(new THREE.ConeGeometry(Math.max(w, d) * 0.75, 5, 4), roofMat);
+    roof.position.set(bx, h + ht + 2.5, bz);
+    roof.rotation.y = Math.PI / 4;
+    town.add(roof);
+  }
+  world.cityLights = town;
+  scene.add(town);
+
+  // --- Ember Arch: the strait's landmark. A natural rock arch on a sea
+  // stack in the southern sea — two dark red-brown pillars and a thick
+  // lintel, one solid silhouette against the sky and sea. It is the
+  // place's signature: it reads at thumbnail size, it recurs across
+  // shots, and no other entry has it. (NOT a red suspension bridge —
+  // that is SKYBOUND's. This is rock, and it is ours.)
+  {
+    const arch = new THREE.Group();
+    const rockMat = new THREE.MeshLambertMaterial({ color: 0x6a4034 });
+    const rockDark = new THREE.MeshLambertMaterial({ color: 0x54332a });
+    // Islet base: a low rock slab breaking the water.
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(62, 78, 14, 12), rockDark);
+    base.position.set(EMBER_ARCH.x, -2, EMBER_ARCH.z);
+    arch.add(base);
+    // Two pillars, slightly tapered, leaning a touch outward.
+    for (const sx of [-1, 1]) {
+      const pillar = new THREE.Mesh(new THREE.CylinderGeometry(10, 14, 56, 10), rockMat);
+      pillar.position.set(EMBER_ARCH.x + sx * 38, 26, EMBER_ARCH.z);
+      pillar.rotation.z = -sx * 0.05;
+      arch.add(pillar);
+    }
+    // Lintel: a half-torus crowning the pillars, tube thick enough to
+    // read as one bold band. Top of the arch ≈ 99 m above the sea.
+    const lintel = new THREE.Mesh(
+      new THREE.TorusGeometry(38, 11, 10, 24, Math.PI), rockMat);
+    lintel.position.set(EMBER_ARCH.x, 50, EMBER_ARCH.z);
+    arch.add(lintel);
+    // A couple of boulders at the foot, so the stack meets the water.
+    for (const [ox, oz, s] of [[-58, 18, 9], [55, -22, 11], [20, 48, 7]]) {
+      const b = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), rockDark);
+      b.position.set(EMBER_ARCH.x + ox, 1, EMBER_ARCH.z + oz);
+      b.rotation.set(Math.random(), Math.random() * Math.PI, Math.random());
+      arch.add(b);
+    }
+    scene.add(arch);
+  }
+
+  // --- Cumulus clouds: FEW, small and white, riding high — Tidewing's
+  // sky is mostly clean blue with a handful of small white puffs, not a
+  // crowded deck. 26 clusters, kept high so they never sit in a shot.
+  const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: 0.92 });
+  for (let i = 0; i < 26; i++) {
+    const cl = new THREE.Group();
+    const puffs = 3 + Math.floor(Math.random() * 3);
+    for (let j = 0; j < puffs; j++) {
+      const p = new THREE.Mesh(new THREE.SphereGeometry(30 + Math.random() * 26, 10, 8), cloudMat);
+      p.position.set(j * 40 - puffs * 18 + Math.random() * 14, Math.random() * 12, Math.random() * 30 - 15);
+      p.scale.y = 0.55;
+      cl.add(p);
+    }
+    cl.position.set((Math.random() * 2 - 1) * 2700, 520 + Math.random() * 280, (Math.random() * 2 - 1) * 2700);
+    cl.userData.speed = 2 + Math.random() * 3;
+    scene.add(cl);
+    world.clouds.push(cl);
+  }
+  // Low storm clouds: only 3, pale grey — no dark masses in the sky.
+  const stormMat = new THREE.MeshLambertMaterial({ color: 0xaab0c6, transparent: true, opacity: 0.85 });
+  for (let i = 0; i < 3; i++) {
+    const cl = new THREE.Group();
+    for (let j = 0; j < 4; j++) {
+      const p = new THREE.Mesh(new THREE.SphereGeometry(46 + Math.random() * 30, 10, 8), stormMat);
+      p.position.set(j * 52 - 70 + Math.random() * 14, Math.random() * 10, Math.random() * 30 - 15);
+      p.scale.y = 0.5;
+      cl.add(p);
+    }
+    cl.position.set((Math.random() * 2 - 1) * 2400, 380 + Math.random() * 60, (Math.random() * 2 - 1) * 2400);
+    cl.userData.speed = 3 + Math.random() * 3;
+    scene.add(cl);
+    world.clouds.push(cl);
+  }
+
+  // --- Runways: dark strips + white centre dashes + threshold bars + edge lights.
+  for (const f of AIRFIELDS) {
+    const g = new THREE.Group();
+    const strip = new THREE.Mesh(new THREE.PlaneGeometry(f.wid, f.len),
+      new THREE.MeshLambertMaterial({ color: 0x2c2f36 }));
+    strip.rotation.x = -Math.PI / 2;
+    g.add(strip);
+    const dashMat = new THREE.MeshBasicMaterial({ color: 0xf5f5f0 });
+    for (let d = -f.len / 2 + 40; d < f.len / 2 - 30; d += 60) {
+      const dash = new THREE.Mesh(new THREE.PlaneGeometry(3, 26), dashMat);
+      dash.rotation.x = -Math.PI / 2;
+      dash.position.y = 0.15;
+      dash.position.z = d;
+      g.add(dash);
+    }
+    const lightMat = new THREE.MeshBasicMaterial({ color: 0x7dff9a });
+    const lightMat2 = new THREE.MeshBasicMaterial({ color: 0xff5a4d });
+    for (let d = -f.len / 2 + 10; d <= f.len / 2 - 10; d += 80) {
+      for (const side of [-1, 1]) {
+        const l = new THREE.Mesh(new THREE.SphereGeometry(2.6, 6, 6), side < 0 ? lightMat : lightMat2);
+        l.position.set(side * (f.wid / 2 + 3), 1.6, d);
+        g.add(l);
       }
     }
-  }
-}
-
-let _seaGrad = null, _seaGradHy = -1, _seaGradH = 0;
-function drawSea(ctx, world, cam, time) {
-  const w = cam.w, h = cam.h;
-  // Horizon line: project a far sea point straight ahead.
-  const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
-  const hp = cam.project(cam.x + fx * 6000, 0, cam.z + fz * 6000);
-  const hy = hp ? hp.y : h * 0.52;
-  // The sea gradient depends only on the (rounded) horizon line: rebuild
-  // it only when the horizon moved, not every frame.
-  const hyR = Math.round(hy / 3) * 3;
-  if (!_seaGrad || _seaGradHy !== hyR || _seaGradH !== h) {
-    const g = ctx.createLinearGradient(0, hyR, 0, h);
-    g.addColorStop(0, '#c96b2e');
-    g.addColorStop(0.25, '#14505e');
-    g.addColorStop(1, '#082e3c');
-    _seaGrad = g; _seaGradHy = hyR; _seaGradH = h;
-  }
-  ctx.fillStyle = _seaGrad;
-  ctx.fillRect(0, hy, w, h - hy);
-  // Gentle wave strokes so the water is not a flat void.
-  ctx.save();
-  for (let i = 0; i < 70; i++) {
-    const t = (i / 70) + Math.sin(time * 0.5 + i * 1.7) * 0.008;
-    const y = hy + (h - hy) * t * t;
-    const spread = (y - hy) * 0.9 + 10;
-    const x = ((Math.sin(i * 78.233) * 43758.5453 % 1) + 1) % 1 * w;
-    const lw = 10 + (y - hy) * 0.22;
-    ctx.globalAlpha = 0.04 + 0.08 * Math.abs(Math.sin(time * 0.9 + i * 2.1));
-    ctx.fillStyle = '#9fd8e8';
-    ctx.fillRect(x - lw / 2, y, lw, 1.6);
-  }
-  ctx.restore();
-  // Sun glitter: bright dashes along the sun's reflection lane.
-  const sd = world.sunDir;
-  const sun = cam.project(cam.x + sd.x * 6000, 60, cam.z + sd.z * 6000);
-  if (sun) {
-    const gx = clamp(sun.x, -200, w + 200);
-    ctx.save();
-    for (let i = 0; i < 42; i++) {
-      const t = (i / 42) + Math.sin(time * 0.7 + i * 2.7) * 0.012;
-      const y = hy + (h - hy) * t * t;
-      const spread = (y - hy) * 0.55 + 8;
-      const x = gx + (Math.sin(i * 12.9898) * 43758.5453 % 1) * spread * 2 - spread;
-      const lw = 8 + (y - hy) * 0.16;
-      ctx.globalAlpha = 0.05 + 0.22 * (1 - t) * Math.abs(Math.sin(time * 1.3 + i));
-      ctx.fillStyle = '#ffd9a0';
-      ctx.fillRect(x, y, lw, 2);
+    // Approach lights: a white bar leading in from behind the threshold,
+    // so a night final reads as a runway, not a dark field.
+    const appMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    for (let k = 1; k <= 5; k++) {
+      const l = new THREE.Mesh(new THREE.SphereGeometry(2.2, 6, 6), appMat);
+      l.position.set(0, 1.6, f.len / 2 + k * 45);
+      g.add(l);
     }
-    ctx.restore();
+    g.position.set(f.x, f.alt + 0.6, f.z);
+    // Strip long axis = landing direction (sin a, -cos a): rotation.y = pi - a.
+    g.rotation.y = Math.PI - (f.headingDeg * Math.PI) / 180;
+    scene.add(g);
   }
-  return hy;
+
+  // --- Windsock at Lumen + harbour boats (simple hulls on the water).
+  const sock = new THREE.Mesh(new THREE.ConeGeometry(4, 18, 8),
+    new THREE.MeshLambertMaterial({ color: 0xff7a1a }));
+  sock.rotation.z = Math.PI / 2;
+  sock.position.set(60, 26, 620);
+  scene.add(sock);
+  const boatMat = new THREE.MeshLambertMaterial({ color: 0xdadada });
+  // Anchorage: rejection-sampled onto real water (terrain < 5 m) in the
+  // southern strait and the western bay — boats on land would be buried.
+  const boatSpots = [];
+  let bTries = 0;
+  while (boatSpots.length < 14 && bTries < 2000) {
+    bTries++;
+    const band = Math.random() < 0.7;
+    const x = band ? (Math.random() * 2 - 1) * 1500 : -2600 + Math.random() * 700;
+    const z = band ? 1600 + Math.random() * 800 : 1500 + Math.random() * 700;
+    if (terrainHeight(x, z) > 5) continue;
+    boatSpots.push([x, z]);
+  }
+  for (const [bx, bz] of boatSpots) {
+    const boat = new THREE.Group();
+    const hull = new THREE.Mesh(new THREE.BoxGeometry(26, 5, 9), boatMat);
+    boat.add(hull);
+    const cab = new THREE.Mesh(new THREE.BoxGeometry(8, 6, 7),
+      new THREE.MeshLambertMaterial({ color: 0x2e6fb0 }));
+    cab.position.set(-3, 5, 0);
+    boat.add(cab);
+    boat.position.set(bx, 4, bz);
+    boat.rotation.y = Math.random() * Math.PI;
+    scene.add(boat);
+  }
+  return world;
 }
 
-// Sky gradient is static per canvas height: build once, reuse every frame.
-// The sun's glow is pre-rendered once into a small offscreen sprite.
-let _skyGrad = null, _skyGradH = 0, _sunSprite = null;
-function skyGradient(ctx, h) {
-  if (!_skyGrad || _skyGradH !== h) {
-    const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, '#141c3d');
-    g.addColorStop(0.42, '#4a2c55');
-    g.addColorStop(0.62, '#a34d3a');
-    g.addColorStop(0.74, '#ff9a3c');
-    g.addColorStop(1, '#2a1a2e');
-    _skyGrad = g; _skyGradH = h;
+export function applySkyPhase(world, scene, phase, t = 0) {
+  const p = SKY_PHASES[phase] || SKY_PHASES.morning;
+  scene.fog.color.setHex(p.fog);
+  world.sun.color.setHex(p.sun);
+  world.sun.intensity = p.sunI;
+  world.sun.position.set(1200 + Math.sin(t) * 200, phase === 'night' ? 500 : 1600, 600);
+  world.hemi.intensity = p.hemi;
+  world.stars.material.opacity = p.stars;
+  // Sky dome gradient: horizon pale, zenith deep.
+  const top = lerpColor(0x2a4a7a, 0x0a1026, phase === 'night' || phase === 'dusk' ? 1 : 0);
+  const horizon = new THREE.Color(p.sky);
+  const posA = world.skyDome.geometry.attributes.position;
+  const colA = world.skyDome.geometry.attributes.color;
+  for (let i = 0; i < posA.count; i++) {
+    const y = posA.getY(i) / 4800; // -1..1
+    const k = Math.max(0, Math.min(1, (y + 0.05) * 1.6));
+    const cc = horizon.clone().lerp(top, k);
+    colA.setXYZ(i, cc.r, cc.g, cc.b);
   }
-  return _skyGrad;
-}
-function sunSprite() {
-  if (_sunSprite) return _sunSprite;
-  const c = document.createElement('canvas');
-  c.width = 520; c.height = 520;
-  const g = c.getContext('2d');
-  const glow = g.createRadialGradient(260, 260, 4, 260, 260, 260);
-  glow.addColorStop(0, 'rgba(255,214,140,0.95)');
-  glow.addColorStop(0.25, 'rgba(255,150,70,0.55)');
-  glow.addColorStop(1, 'rgba(255,120,40,0)');
-  g.fillStyle = glow;
-  g.fillRect(0, 0, 520, 520);
-  g.fillStyle = '#fff3cf';
-  g.beginPath(); g.arc(260, 260, 34, 0, Math.PI * 2); g.fill();
-  _sunSprite = c;
-  return c;
+  colA.needsUpdate = true;
+  scene.background = new THREE.Color(p.sky);
 }
 
-function drawSky(ctx, world, cam, time) {
-  const w = cam.w, h = cam.h;
-  ctx.fillStyle = skyGradient(ctx, h);
-  ctx.fillRect(0, 0, w, h);
-  // Sun: low ahead-left on the northbound route.
-  const sd = world.sunDir;
-  const sp = cam.project(cam.x + sd.x * 8000, 500, cam.z + sd.z * 8000);
-  if (sp && sp.x > -300 && sp.x < w + 300 && sp.y > -200 && sp.y < h * 0.8) {
-    ctx.drawImage(sunSprite(), sp.x - 260, sp.y - 260);
-  }
-}
-
-function drawClouds(ctx, world, cam, time) {
-  const drift = WORLD.wind.x * time * 0.8; // clouds ride the wind east
-  for (const cl of world.clouds) {
-    const p = cam.project(cl.x + drift, cl.y, cl.z);
-    if (!p || p.d > 9000) continue;
-    const s = cl.s * p.s * 0.5;
-    ctx.fillStyle = `rgba(255,214,190,${cl.a})`;
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y, s, s * 0.32, 0, 0, Math.PI * 2);
-    ctx.ellipse(p.x - s * 0.55, p.y + s * 0.08, s * 0.6, s * 0.24, 0, 0, Math.PI * 2);
-    ctx.ellipse(p.x + s * 0.6, p.y + s * 0.06, s * 0.65, s * 0.26, 0, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-
-function drawRunway(ctx, world, cam) {
-  const rw = world.runway || WORLD.runway;
-  const y = 1.2;
-  const hl = rw.len / 2, hw = rw.wid / 2;
-  // The strip is drawn in segments: when the plane is on short final the
-  // nearest segments fall behind the camera plane and are skipped, while
-  // the rest of the runway still draws (a whole-strip draw would vanish).
-  const SEGS = 12;
-  for (let s = 0; s < SEGS; s++) {
-    const z0 = rw.z - hl + (rw.len * s) / SEGS;
-    const z1 = rw.z - hl + (rw.len * (s + 1)) / SEGS;
-    const corners = [
-      cam.project(rw.x - hw, y, z0), cam.project(rw.x + hw, y, z0),
-      cam.project(rw.x + hw, y, z1), cam.project(rw.x - hw, y, z1),
-    ];
-    if (corners.some(p => !p)) continue;
-    drawPoly(ctx, corners, '#23262e');
-  }
-  // Centreline dashes.
-  ctx.fillStyle = '#f2f2e8';
-  for (let d = -hl + 30; d < hl - 10; d += 60) {
-    const a = cam.project(rw.x - 2, y + 0.2, rw.z + d);
-    const b = cam.project(rw.x + 2, y + 0.2, rw.z + d + 34);
-    if (!a || !b) continue;
-    ctx.fillRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x) + 1.5, Math.abs(b.y - a.y) + 1.5);
-  }
-  // Threshold bars at both ends.
-  for (const end of [-1, 1]) {
-    const z = rw.z + end * (hl - 22);
-    for (let k = -2; k <= 2; k++) {
-      const a = cam.project(rw.x + k * 9 - 3, y + 0.2, z);
-      const b = cam.project(rw.x + k * 9 + 3, y + 0.2, z + 14);
-      if (!a || !b) continue;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x) + 1, Math.abs(b.y - a.y) + 1);
-    }
-  }
-  // Edge lights: warm dots down both sides.
-  for (let d = -hl + 20; d <= hl - 20; d += 80) {
-    for (const side of [-1, 1]) {
-      const p = cam.project(rw.x + side * (hw + 3), y + 1, rw.z + d);
-      if (!p) continue;
-      const r = clamp(90 / p.d, 1, 4);
-      ctx.fillStyle = '#ffd27a';
-      ctx.beginPath(); ctx.arc(p.x, p.y, r + 1.6, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#fff6d8';
-      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-    }
-  }
-}
-
-function drawLighthouse(ctx, world, cam, time) {
-  const L = world.lighthouse || WORLD.lighthouse;
-  const gy = world.groundHeight(L.x, L.z);
-  const base = cam.project(L.x, gy, L.z);
-  const top = cam.project(L.x, gy + 42, L.z);
-  if (!base || !top) return;
-  const wBottom = clamp(900 / base.d, 2, 14), wTop = wBottom * 0.55;
-  // Tapered tower: alternating red/white bands.
-  const bands = 4;
-  for (let i = 0; i < bands; i++) {
-    const y0 = gy + (42 * i) / bands, y1 = gy + (42 * (i + 1)) / bands;
-    const p0 = cam.project(L.x - wBottom, y0, L.z), p1 = cam.project(L.x + wBottom, y0, L.z);
-    const p2 = cam.project(L.x + wTop, y1, L.z), p3 = cam.project(L.x - wTop, y1, L.z);
-    if (!p0 || !p1 || !p2 || !p3) continue;
-    drawPoly(ctx, [p0, p1, p2, p3], i % 2 ? '#e8e2d4' : '#c23b2e');
-  }
-  // Lamp room + rotating beam.
-  ctx.fillStyle = '#ffd98a';
-  ctx.beginPath(); ctx.arc(top.x, top.y - 3, clamp(700 / top.d, 2, 8), 0, Math.PI * 2); ctx.fill();
-  const ang = time * 0.5;
-  const bx = top.x + Math.cos(ang) * 90, by = top.y - 3 + Math.sin(ang) * 10;
-  const beam = ctx.createLinearGradient(top.x, top.y, bx, by);
-  beam.addColorStop(0, 'rgba(255,220,150,0.5)');
-  beam.addColorStop(1, 'rgba(255,220,150,0)');
-  ctx.fillStyle = beam;
-  ctx.beginPath();
-  ctx.moveTo(top.x, top.y - 3);
-  ctx.lineTo(bx + 8, by + 4); ctx.lineTo(bx - 8, by - 10);
-  ctx.closePath(); ctx.fill();
-}
-
-function drawRings(ctx, world, cam, passed, showLabels) {
-  const next = passed.findIndex((p) => !p);
-  for (let i = 0; i < world.rings.length; i++) {
-    const R = world.rings[i];
-    const c = cam.project(R.x, R.y, R.z);
-    if (!c) continue;
-    const done = passed[i];
-    const col = done ? '#39d353' : '#ffb020';
-    // Sample the circle into the ring scratch (ring faces south, toward
-    // the incoming plane) — no per-point objects.
-    const base = i * 29;
-    let any = false;
-    for (let k = 0; k <= 28; k++) {
-      const a = (k / 28) * Math.PI * 2;
-      const o = base + k;
-      if (cam.projectInto(R.x + Math.cos(a) * R.r, R.y + Math.sin(a) * R.r, R.z, _tmpPt)) {
-        world.ringProj[o * 4] = _tmpPt.x; world.ringProj[o * 4 + 1] = _tmpPt.y;
-        world.ringProj[o * 4 + 2] = _tmpPt.d; world.ringProj[o * 4 + 3] = _tmpPt.s;
-        world.ringOk[o] = 1; any = true;
-      } else world.ringOk[o] = 0;
-    }
-    if (!any) continue;
-    const rp = world.ringProj;
-    const trace = (width, alpha) => {
-      ctx.strokeStyle = col;
-      ctx.globalAlpha = alpha;
-      ctx.lineWidth = width;
-      ctx.beginPath();
-      ctx.moveTo(rp[base * 4], rp[base * 4 + 1]);
-      for (let k = 1; k <= 28; k++) {
-        const o = base + k;
-        if (world.ringOk[o]) ctx.lineTo(rp[o * 4], rp[o * 4 + 1]);
-      }
-      ctx.closePath(); ctx.stroke();
-    };
-    const lw = clamp(260 / c.d, 1.5, 7);
-    ctx.save();
-    ctx.lineJoin = 'round';
-    if (done) {
-      // Cleared rings fade to a thin green trace so they never dominate.
-      trace(Math.max(1, lw * 0.7), 0.28);
-      ctx.restore();
-      continue;
-    }
-    trace(lw * 3.2, 0.16);
-    trace(lw * 1.8, 0.35);
-    trace(lw, 0.95);
-    ctx.restore();
-    // Label only the next ring, below it so it never sits on the plane,
-    // and only once it is close enough to loom large.
-    if (showLabels !== false && i === next && c.d < 1200 && R.r * c.s > 55) {
-      ctx.fillStyle = 'rgba(10,16,30,0.75)';
-      const label = `RING ${i + 1}`;
-      ctx.font = 'bold 13px Arial, sans-serif';
-      const tw = ctx.measureText(label).width;
-      ctx.fillRect(c.x - tw / 2 - 6, c.y + R.r * c.s + 6, tw + 12, 20);
-      ctx.fillStyle = '#ffd98a';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(label, c.x, c.y + R.r * c.s + 16);
-    }
-  }
-}
-
-// PAPI approach lights beside the south threshold: four lamps whose colour
-// reads the glidepath — white = above it, red = below it (2 white + 2 red
-// is on the 3-degree slope). A real landing aid, not decoration.
-function drawPapi(ctx, world, cam, plane) {
-  const rw = world.runway || WORLD.runway;
-  const hl = rw.len / 2;
-  const tx = rw.x - rw.wid / 2 - 26, tz = rw.z + hl - 30;
-  const dz = plane.z - tz, dx = plane.x - tx;
-  const dist = Math.hypot(dx, dz);
-  if (dist > 2600) return;
-  const ideal = dist * Math.tan(3 * Math.PI / 180);
-  const err = plane.y - 2 - ideal; // height above the 3-degree slope
-  // 4 white if >+25 m high, 3W1R >+10, 2W2R within +/-10, 1W3R <-10, 4 red <-25.
-  const whites = err > 25 ? 4 : err > 10 ? 3 : err > -10 ? 2 : err > -25 ? 1 : 0;
-  for (let k = 0; k < 4; k++) {
-    const p = cam.project(tx, 3, tz + k * 9);
-    if (!p) continue;
-    const r = clamp(120 / p.d, 1.5, 5);
-    const white = k < whites;
-    ctx.fillStyle = white ? '#ffffff' : '#ff2e2e';
-    ctx.beginPath(); ctx.arc(p.x, p.y, r + 1.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = white ? '#fff8e0' : '#ff6a5c';
-    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-  }
+// Ring meshes: torus + translucent disc, rebuilt per mission.
+export function buildRings(scene, rings) {
+  const group = new THREE.Group();
+  const meshes = [];
+  rings.forEach((ring, i) => {
+    const torus = new THREE.Mesh(
+      new THREE.TorusGeometry(ring.r, 2.2, 10, 40),
+      new THREE.MeshBasicMaterial({ color: i === 0 ? 0xffb020 : 0xff5a1a }),
+    );
+    torus.position.set(ring.x, ring.y, ring.z);
+    // Face the ring toward the previous ring / start so the pilot sees the hole.
+    const prev = i === 0 ? { x: 0, y: 120, z: 950 } : rings[i - 1];
+    torus.lookAt(prev.x, prev.y, prev.z);
+    const disc = new THREE.Mesh(
+      new THREE.CircleGeometry(ring.r * 0.94, 28),
+      new THREE.MeshBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.10, side: THREE.DoubleSide }),
+    );
+    disc.position.copy(torus.position);
+    disc.quaternion.copy(torus.quaternion);
+    group.add(torus, disc);
+    meshes.push(torus);
+  });
+  scene.add(group);
+  return { group, meshes };
 }

@@ -1,337 +1,194 @@
-// SUNSET STRAIT — hud.js
-// The HUD and the lit instrument panel: altitude / speed / heading chips,
-// an altimeter, an airspeed dial, a compass tape and an artificial horizon,
-// all drawn on the game canvas with a warm amber backlight. Plus the
-// title, crash and landing screens and the centre message banners.
+// hud.js — every DOM instrument: mission panel + objective checklist,
+// compass strip, ALT/SPD/HDG readouts, fuel/damage/wind, throttle and
+// gear/flap state, a live minimap, radio messages and the title/pause/
+// win/crash screens. Big numerals stay readable at 300 px wide.
 
-function drawChip(ctx, x, y, label, value, unit, w) {
-  ctx.save();
-  ctx.fillStyle = 'rgba(8,14,28,0.62)';
-  roundRect(ctx, x, y, w, 52, 8); ctx.fill();
-  ctx.strokeStyle = 'rgba(255,210,130,0.35)'; ctx.lineWidth = 1;
-  roundRect(ctx, x, y, w, 52, 8); ctx.stroke();
-  ctx.fillStyle = '#ffb85e';
-  ctx.font = 'bold 11px Arial, sans-serif';
-  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-  ctx.fillText(label, x + 10, y + 17);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 24px Arial, sans-serif';
-  ctx.fillText(value, x + 10, y + 43);
-  // Measure the value in ITS OWN (24px) font: measuring after switching
-  // to the 12px unit font under-measures and the unit overlaps the value.
-  const valueW = ctx.measureText(value).width;
-  ctx.fillStyle = '#c9d4e8';
-  ctx.font = 'bold 12px Arial, sans-serif';
-  ctx.fillText(unit, x + 10 + valueW + 6, y + 43);
-  ctx.restore();
+import { AIRFIELDS, EMBER_ARCH } from './terrain.js';
+
+export function buildHud(root) {
+  root.innerHTML = `
+  <div id="hud-top">
+    <div id="mission-panel" class="panel">
+      <div id="mission-mode">RING RUN</div>
+      <div id="mission-name">Harbour Ring Trial</div>
+      <div id="mission-brief"></div>
+      <div id="objectives"></div>
+      <div id="score-line">SCORE <b id="score">0</b> &nbsp;·&nbsp; <span id="clock">0:00</span></div>
+    </div>
+    <div id="compass-wrap"><div id="compass"></div><div id="compass-needle">▲</div></div>
+    <div id="sys-panel" class="panel">
+      <div class="sys-row"><span>ENG</span><b id="sys-eng">—</b></div>
+      <div class="sys-row"><span>FUEL</span><div class="bar"><i id="bar-fuel"></i></div><b id="sys-fuel">100%</b></div>
+      <div class="sys-row"><span>DMG</span><div class="bar"><i id="bar-dmg"></i></div><b id="sys-dmg">0%</b></div>
+      <div class="sys-row"><span>WIND</span><b id="sys-wind">300°/12KT</b></div>
+      <div class="sys-row"><span>GEAR</span><b id="sys-gear">DOWN</b></div>
+      <div class="sys-row"><span>FLAPS</span><b id="sys-flaps">UP</b></div>
+    </div>
+  </div>
+  <div id="radio" class="hidden"></div>
+  <div id="centre-msg"></div>
+  <div id="hud-bottom">
+    <div id="gauges" class="panel">
+      <div class="gauge"><div class="g-label">ALTITUDE</div><div class="g-big"><span id="g-alt">0</span><small> FT</small></div><div class="g-sub">VS <span id="g-vs">0</span> FT/MIN</div></div>
+      <div class="gauge"><div class="g-label">AIRSPEED</div><div class="g-big"><span id="g-spd">0</span><small> KT</small></div><div class="g-sub">THR <span id="g-thr">0</span>%</div></div>
+      <div class="gauge"><div class="g-label">HEADING</div><div class="g-big"><span id="g-hdg">000</span><small>°</small></div><div class="g-sub">BANK <span id="g-bank">0</span>°</div></div>
+      <div id="thr-wrap"><div class="g-label">THROTTLE</div><div id="thr-bar"><i id="thr-fill"></i></div></div>
+    </div>
+    <div id="minimap-wrap" class="panel"><canvas id="minimap" width="220" height="220"></canvas><div id="minimap-label">STRAIT MAP — N ↑</div></div>
+  </div>
+  <div id="hint">ARROWS pitch + bank &nbsp;·&nbsp; SHIFT / CTRL throttle &nbsp;·&nbsp; C camera &nbsp;·&nbsp; G gear &nbsp;·&nbsp; F flaps &nbsp;·&nbsp; B brakes &nbsp;·&nbsp; P pause &nbsp;·&nbsp; R restart &nbsp;·&nbsp; M sound &nbsp;·&nbsp; 1–8 missions</div>
+  <div id="screen" class="hidden"></div>`;
+  return {
+    el: (id) => root.querySelector('#' + id),
+    minimap: root.querySelector('#minimap'),
+  };
 }
 
-function roundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
+function fmtClock(t) {
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+function hdgDeg(heading) {
+  let d = Math.round((heading * 180) / Math.PI) % 360;
+  if (d < 0) d += 360;
+  return d;
 }
 
-function drawHud(ctx, plane, score, ringsGot, ringsTotal, timeSec, objective, nowSec) {
-  const w = ctx.canvas.width;
-  const altFt = Math.max(0, Math.round(plane.y * 3.281));
-  const spdKt = Math.round(plane.speed * 1.944);
-  const hdg = Math.round(((deg(plane.yaw) % 360) + 360) % 360);
-  drawChip(ctx, 16, 14, 'ALTITUDE', String(altFt), 'FT', 148);
-  drawChip(ctx, 172, 14, 'AIRSPEED', String(spdKt), 'KT', 148);
-  drawChip(ctx, 328, 14, 'HEADING', String(hdg).padStart(3, '0'), '°', 128);
-  drawChip(ctx, 464, 14, 'THROTTLE', Math.round(plane.throttle * 100) + '', '%', 128);
-  // Fuel chip with a burn bar: green > 50, amber 25-50, red + flashing below 25.
-  const fuel = Math.max(0, Math.round(plane.fuel));
-  const lowFuel = fuel < 25;
-  const flash = lowFuel && Math.floor(nowSec * 2) % 2 === 0;
-  drawChip(ctx, 608, 14, 'FUEL', String(fuel), '%', 128);
-  ctx.save();
-  ctx.fillStyle = 'rgba(255,255,255,0.16)';
-  ctx.fillRect(618, 52, 108, 5);
-  ctx.fillStyle = flash ? '#ff2e2e' : fuel > 50 ? '#39d353' : fuel >= 25 ? '#ffb020' : '#ff2e2e';
-  ctx.fillRect(618, 52, 108 * fuel / 100, 5);
-  if (flash) {
-    ctx.strokeStyle = '#ff2e2e'; ctx.lineWidth = 2;
-    roundRect(ctx, 608, 14, 128, 52, 8); ctx.stroke();
+export function updateHud(hud, s, mission, opts) {
+  const $ = hud.el;
+  $('mission-mode').textContent = mission.mode + '  ·  MISSION ' + mission.id + '/8';
+  $('mission-name').textContent = mission.name;
+  $('mission-brief').textContent = mission.brief;
+  const objs = [];
+  mission.rings.forEach((r, i) => {
+    objs.push(`<div class="obj ${i < s.ringIndex ? 'done' : i === s.ringIndex ? 'live' : ''}">${i < s.ringIndex ? '✓' : '○'} RING ${i + 1}/${mission.rings.length}</div>`);
+  });
+  const field = AIRFIELDS.find((f) => f.id === mission.landAt);
+  objs.push(`<div class="obj ${s.landed ? 'done' : s.ringIndex >= mission.rings.length ? 'live' : ''}">${s.landed ? '✓' : '○'} LAND ${field.name.toUpperCase()}</div>`);
+  $('objectives').innerHTML = objs.join('');
+  $('score').textContent = s.score.toLocaleString('en-US');
+  $('clock').textContent = fmtClock(s.time);
+
+  // Compass strip: one tick every 30° of absolute heading, cardinal labels.
+  const hd = hdgDeg(s.heading);
+  let ticks = '';
+  const start = Math.floor((hd - 90) / 30) * 30;
+  for (let a = start; a <= hd + 90; a += 30) {
+    const v = ((a % 360) + 360) % 360;
+    const d = a - hd;
+    const label = v % 90 === 0 ? ({ 0: 'N', 90: 'E', 180: 'S', 270: 'W' })[v] : String(v).padStart(3, '0');
+    ticks += `<span class="tick" style="left:${50 + d * 0.55}%">${label}<i></i></span>`;
   }
-  ctx.restore();
-  // Wind chip: direction the wind blows FROM, plus its speed.
-  drawChip(ctx, 744, 14, 'WIND', String(WORLD.wind.fromDeg) + '°', WORLD.wind.speedKt + ' KT', 148);
-  // Right side: rings + score + time.
-  drawChip(ctx, w - 268, 14, 'RINGS', ringsGot + '/' + ringsTotal, '', 124);
-  drawChip(ctx, w - 136, 14, 'SCORE', String(score), '', 120);
-  // Objective line under the chips.
-  ctx.save();
-  ctx.font = 'bold 15px Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillStyle = 'rgba(8,14,28,0.6)';
-  const tw = ctx.measureText(objective).width;
-  roundRect(ctx, w / 2 - tw / 2 - 14, 76, tw + 28, 28, 8); ctx.fill();
-  ctx.fillStyle = '#ffe1a8';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(objective, w / 2, 91);
-  ctx.restore();
-  // Low-fuel warning under the objective line.
-  if (lowFuel) {
-    ctx.save();
-    ctx.font = 'bold 15px Arial, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = flash ? '#ff5a3c' : '#ffb020';
-    ctx.fillText('LOW FUEL — LAND AT THE RUNWAY SOON', w / 2, 122);
-    ctx.restore();
+  // Half-ticks between labels.
+  for (let a = start + 15; a <= hd + 90; a += 30) {
+    const d = a - hd;
+    ticks += `<span class="tick" style="left:${50 + d * 0.55}%"><i></i></span>`;
   }
-  // Timer, bottom-right.
-  const mm = String(Math.floor(timeSec / 60)).padStart(2, '0');
-  const ss = String(Math.floor(timeSec % 60)).padStart(2, '0');
+  $('compass').innerHTML = ticks;
+
+  $('sys-fuel').textContent = Math.round(s.fuel) + '%';
+  $('bar-fuel').style.width = s.fuel + '%';
+  $('bar-fuel').style.background = s.fuel < 25 ? '#ff5a4d' : '#7dff9a';
+  $('sys-dmg').textContent = Math.round(s.damage) + '%';
+  $('bar-dmg').style.width = s.damage + '%';
+  $('sys-wind').textContent = `${mission.windDeg}°/${mission.windKts}KT${mission.gustKts ? ' G' + (mission.windKts + mission.gustKts) : ''}`;
+  $('sys-eng').textContent = s.fuel <= 0 ? 'FLAMEOUT' : s.throttle > 0.7 ? 'MAX' : s.throttle > 0.3 ? 'CRUISE' : s.throttle > 0 ? 'IDLE' : 'OFF';
+  $('sys-gear').textContent = s.gearDown ? 'DOWN' : 'UP';
+  $('sys-flaps').textContent = s.flaps ? 'DOWN' : 'UP';
+
+  $('g-alt').textContent = Math.max(0, Math.round(s.y * 3.28084)).toLocaleString('en-US');
+  $('g-vs').textContent = Math.round(s.vspeed * 196.85);
+  $('g-spd').textContent = Math.round(s.speedKts);
+  $('g-thr').textContent = Math.round(s.throttle * 100);
+  $('g-hdg').textContent = String(hd).padStart(3, '0');
+  $('g-bank').textContent = Math.round((s.bank * 180) / Math.PI);
+  $('thr-fill').style.height = s.throttle * 100 + '%';
+
+  // Radio toast: newest message, 6 seconds.
+  const radio = $('radio');
+  if (s.message && s.time - s.messageAt < 6) {
+    radio.classList.remove('hidden');
+    radio.textContent = '📻 ' + s.message;
+  } else radio.classList.add('hidden');
+  const cm = $('centre-msg');
+  if (s.finished) {
+    cm.textContent = s.won ? '★ SORTIE COMPLETE ★' : s.crashed ? '✕ AIRCRAFT LOST' : 'LANDED';
+    cm.className = s.won ? 'win' : 'lose';
+  } else if (opts.paused) {
+    cm.textContent = 'PAUSED — P TO RESUME';
+    cm.className = 'pause';
+  } else cm.textContent = '';
+
+  drawMinimap(hud.minimap, s, mission);
+}
+
+export function drawMinimap(canvas, s, mission) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const toMap = (x, z) => [((x + 3000) / 6000) * W, ((z + 3000) / 6000) * H];
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0e2a44';
+  ctx.fillRect(0, 0, W, H);
+  // Island blobs (same centres as the real terrain, simplified).
+  ctx.fillStyle = '#3f7a3a';
+  const blobs = [[-1500, -1150, 42], [0, 620, 52], [1420, -560, 34], [980, 1560, 28], [-2350, 900, 22], [2300, 900, 20], [-700, 2100, 18], [2400, -1700, 19], [-2600, -1900, 16]];
+  for (const [x, z, r] of blobs) {
+    const [mx, my] = toMap(x, z);
+    ctx.beginPath(); ctx.arc(mx, my, r * (W / 6000) * 2.4, 0, Math.PI * 2); ctx.fill();
+  }
+  // Volcano marker.
+  const [vx, vy] = toMap(-1500, -1150);
+  ctx.fillStyle = '#ff5a1a';
+  ctx.beginPath(); ctx.arc(vx, vy, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 9px sans-serif'; ctx.fillText('BARA', vx + 7, vy + 3);
+  // Ember Arch landmark marker (orange diamond + label).
+  const [ax, ay] = toMap(EMBER_ARCH.x, EMBER_ARCH.z);
+  ctx.fillStyle = '#ffb020';
+  ctx.beginPath(); ctx.moveTo(ax, ay - 5); ctx.lineTo(ax + 5, ay); ctx.lineTo(ax, ay + 5); ctx.lineTo(ax - 5, ay); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 9px sans-serif'; ctx.fillText('ARCH', ax + 7, ay + 3);
+  // Runways.
+  ctx.strokeStyle = '#f5f5f0'; ctx.lineWidth = 2;
+  for (const f of AIRFIELDS) {
+    const [fx, fy] = toMap(f.x, f.z);
+    const a = (f.headingDeg * Math.PI) / 180;
+    ctx.beginPath();
+    ctx.moveTo(fx - Math.sin(a) * 12, fy + Math.cos(a) * 12);
+    ctx.lineTo(fx + Math.sin(a) * 12, fy - Math.cos(a) * 12);
+    ctx.stroke();
+  }
+  // Rings: next ring gold, done green, later dim.
+  mission.rings.forEach((r, i) => {
+    const [rx, ry] = toMap(r.x, r.z);
+    ctx.strokeStyle = i < s.ringIndex ? '#7dff9a' : i === s.ringIndex ? '#ffb020' : 'rgba(255,255,255,0.45)';
+    ctx.lineWidth = i === s.ringIndex ? 2.5 : 1.5;
+    ctx.beginPath(); ctx.arc(rx, ry, 5, 0, Math.PI * 2); ctx.stroke();
+  });
+  // Plane arrow.
+  const [px, py] = toMap(s.x, s.z);
   ctx.save();
-  ctx.font = 'bold 15px Arial, sans-serif';
-  ctx.textAlign = 'right';
-  ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.fillText(`TIME ${mm}:${ss}`, w - 16, ctx.canvas.height - 16);
+  ctx.translate(px, py);
+  ctx.rotate(s.heading);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(5, 6); ctx.lineTo(0, 3); ctx.lineTo(-5, 6); ctx.closePath(); ctx.fill();
   ctx.restore();
 }
 
-// ---- lit instrument panel (bottom centre) ----
-// The amber panel glow depends only on the panel box: cache it per box.
-let _panelGlow = null, _panelGlowKey = '';
-function drawInstruments(ctx, plane, w, h, cockpit) {
-  const pw = cockpit ? 560 : 420;
-  const ph = cockpit ? 132 : 96;
-  const px = (w - pw) / 2, py = h - ph - 12;
-  ctx.save();
-  const glowKey = `${px},${py},${pw},${ph}`;
-  if (!_panelGlow || _panelGlowKey !== glowKey) {
-    const glow = ctx.createRadialGradient(w / 2, py + ph / 2, 10, w / 2, py + ph / 2, pw * 0.6);
-    glow.addColorStop(0, 'rgba(255,170,80,0.20)');
-    glow.addColorStop(1, 'rgba(255,170,80,0)');
-    _panelGlow = glow; _panelGlowKey = glowKey;
-  }
-  ctx.fillStyle = _panelGlow;
-  ctx.fillRect(px - 40, py - 40, pw + 80, ph + 80);
-  ctx.fillStyle = 'rgba(12,16,28,0.88)';
-  roundRect(ctx, px, py, pw, ph, 12); ctx.fill();
-  ctx.strokeStyle = 'rgba(255,190,110,0.45)'; ctx.lineWidth = 1.5;
-  roundRect(ctx, px, py, pw, ph, 12); ctx.stroke();
-  const cy = py + ph / 2;
-  const r = (ph - 26) / 2;
-  // Artificial horizon (left).
-  drawHorizon(ctx, px + 12 + r, cy, r, plane.pitch, plane.roll);
-  // Altimeter dial.
-  drawDial(ctx, px + 24 + r * 2 + r, cy, r, Math.max(0, plane.y * 3.281), 0, 9000, 'ALT', 'FT');
-  // Airspeed dial.
-  drawDial(ctx, px + 36 + r * 4 + r, cy, r, plane.speed * 1.944, 0, 200, 'SPD', 'KT');
-  // Compass tape (right), leaving room for the GEAR / FULL lamps.
-  const tx = px + 48 + r * 6 + 6, tw = pw - (48 + r * 6 + 6) - 46;
-  drawCompass(ctx, tx, py + 14, tw, ph - 28, plane.yaw);
-  // Gear / flap / speedbrake / full-throttle lamps.
-  ctx.font = 'bold 10px Arial, sans-serif';
-  ctx.textAlign = 'center';
-  lamp(ctx, px + pw - 30, py + 14, plane.gearDown, 'GEAR');
-  lamp(ctx, px + pw - 30, py + 34, plane.flaps, 'FLAP');
-  lamp(ctx, px + pw - 30, py + 54, plane.speedbrake, 'BRK');
-  lamp(ctx, px + pw - 30, py + 74, plane.throttle > 0.85, 'FULL');
-  ctx.restore();
+export function showScreen(hud, html) {
+  const sc = hud.el('screen');
+  sc.innerHTML = html;
+  sc.classList.remove('hidden');
 }
+export function hideScreen(hud) { hud.el('screen').classList.add('hidden'); }
 
-function lamp(ctx, x, y, on, label) {
-  ctx.fillStyle = on ? '#39d353' : 'rgba(255,255,255,0.18)';
-  ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = on ? '#b8ffce' : 'rgba(255,255,255,0.45)';
-  ctx.font = 'bold 9px Arial, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.fillText(label, x + 9, y + 3);
-}
-
-function drawHorizon(ctx, x, y, r, pitch, roll) {
-  ctx.save();
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.clip();
-  ctx.translate(x, y);
-  ctx.rotate(-roll);
-  const off = clamp(pitch, -0.6, 0.6) * r * 1.4;
-  ctx.fillStyle = '#2b4a6b';
-  ctx.fillRect(-r, -r + off, r * 2, r);
-  ctx.fillStyle = '#c97a2e';
-  ctx.fillRect(-r, off, r * 2, r);
-  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.moveTo(-r, off); ctx.lineTo(r, off); ctx.stroke();
-  ctx.restore();
-  // Fixed wings marker.
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(-r * 0.55, 0); ctx.lineTo(-r * 0.2, 0);
-  ctx.moveTo(r * 0.2, 0); ctx.lineTo(r * 0.55, 0);
-  ctx.moveTo(0, -3); ctx.lineTo(0, 3);
-  ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,190,110,0.6)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
-  ctx.restore();
-}
-
-function drawDial(ctx, x, y, r, value, min, max, label, unit) {
-  ctx.save();
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = '#101828'; ctx.fill();
-  ctx.strokeStyle = 'rgba(255,190,110,0.55)'; ctx.lineWidth = 1.5; ctx.stroke();
-  // Ticks.
-  ctx.strokeStyle = 'rgba(255,255,255,0.75)'; ctx.lineWidth = 1;
-  for (let i = 0; i <= 10; i++) {
-    const a = Math.PI * 0.75 + (i / 10) * Math.PI * 1.5;
-    const x0 = x + Math.cos(a) * (r - 3), y0 = y + Math.sin(a) * (r - 3);
-    const x1 = x + Math.cos(a) * (r - 8), y1 = y + Math.sin(a) * (r - 8);
-    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
-  }
-  // Needle.
-  const frac = clamp((value - min) / (max - min), 0, 1);
-  const a = Math.PI * 0.75 + frac * Math.PI * 1.5;
-  ctx.strokeStyle = '#ffb020'; ctx.lineWidth = 2.5;
-  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * (r - 10), y + Math.sin(a) * (r - 10)); ctx.stroke();
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 10px Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText(label, x, y + r * 0.45);
-  ctx.font = 'bold 12px Arial, sans-serif';
-  ctx.fillStyle = '#ffd98a';
-  ctx.fillText(String(Math.round(value)), x, y - r * 0.42);
-  ctx.restore();
-}
-
-function drawCompass(ctx, x, y, w, h, yaw) {
-  ctx.save();
-  ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip();
-  ctx.fillStyle = 'rgba(16,24,40,0.9)';
-  ctx.fillRect(x, y, w, h);
-  const hdg = ((deg(yaw) % 360) + 360) % 360;
-  const pxPerDeg = w / 90;
-  ctx.font = 'bold 12px Arial, sans-serif';
-  ctx.textAlign = 'center';
-  for (let d = -60; d <= 60; d += 5) {
-    const hd = Math.round((hdg + d) / 5) * 5;
-    const off = ((hd - hdg + 540) % 360) - 180;
-    const sx = x + w / 2 + off * pxPerDeg;
-    if (sx < x - 10 || sx > x + w + 10) continue;
-    const major = hd % 30 === 0;
-    ctx.strokeStyle = major ? '#ffd98a' : 'rgba(255,255,255,0.4)';
-    ctx.lineWidth = major ? 2 : 1;
-    ctx.beginPath(); ctx.moveTo(sx, y + 6); ctx.lineTo(sx, y + (major ? 18 : 12)); ctx.stroke();
-    if (major) {
-      const names = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
-      const hh = ((hd % 360) + 360) % 360;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(names[hh] || String(hh).padStart(3, '0'), sx, y + h - 8);
-    }
-  }
-  // Centre lubber line.
-  ctx.fillStyle = '#ff5a3c';
-  ctx.fillRect(x + w / 2 - 1, y + 2, 2, h - 4);
-  ctx.restore();
-  ctx.strokeStyle = 'rgba(255,190,110,0.5)';
-  ctx.strokeRect(x, y, w, h);
-}
-
-// ---- banners & screens ----
-function drawBanner(ctx, text, sub, w, h) {
-  ctx.save();
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 34px Arial, sans-serif';
-  ctx.fillStyle = 'rgba(8,14,28,0.65)';
-  const tw = ctx.measureText(text).width;
-  roundRect(ctx, w / 2 - tw / 2 - 20, h * 0.3 - 30, tw + 40, 58, 10); ctx.fill();
-  ctx.fillStyle = '#ffe1a8';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, w / 2, h * 0.3);
-  if (sub) {
-    ctx.font = 'bold 17px Arial, sans-serif';
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(sub, w / 2, h * 0.3 + 42);
-  }
-  ctx.restore();
-}
-
-function drawTitle(ctx, w, h, time) {
-  ctx.save();
-  // Title shade is static per canvas size: cache the gradient.
-  const key = `${w}x${h}`;
-  if (drawTitle._gradKey !== key) {
-    const g = ctx.createLinearGradient(0, 0, 0, h);
-    g.addColorStop(0, 'rgba(10,12,30,0.25)');
-    g.addColorStop(0.55, 'rgba(10,12,30,0)');
-    g.addColorStop(1, 'rgba(10,12,30,0.55)');
-    drawTitle._grad = g; drawTitle._gradKey = key;
-  }
-  ctx.fillStyle = drawTitle._grad;
-  ctx.fillRect(0, 0, w, h);
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#ffd166';
-  ctx.font = 'bold 26px Arial, sans-serif';
-  ctx.fillText('M A K E . F U N   P R E S E N T S', w / 2, h * 0.2);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 84px Arial, sans-serif';
-  ctx.shadowColor = 'rgba(255,150,60,0.8)'; ctx.shadowBlur = 34;
-  ctx.fillText('SUNSET STRAIT', w / 2, h * 0.2 + 88);
-  ctx.shadowBlur = 0;
-  ctx.font = 'bold 22px Arial, sans-serif';
-  ctx.fillStyle = '#ffe1a8';
-  ctx.shadowColor = 'rgba(10,10,25,0.9)'; ctx.shadowBlur = 10;
-  ctx.fillText('Fly the golden coast. Thread six rings. Land on the island runway.', w / 2, h * 0.2 + 132);
-  ctx.shadowBlur = 0;
-  const blink = 0.65 + 0.35 * Math.sin(time * 3);
-  ctx.globalAlpha = blink;
-  ctx.font = 'bold 26px Arial, sans-serif';
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText('PRESS ENTER OR CLICK TO FLY', w / 2, h * 0.80);
-  ctx.globalAlpha = 1;
-  ctx.font = '15px Arial, sans-serif';
-  ctx.fillStyle = 'rgba(255,255,255,0.9)';
-  ctx.fillText('← → bank  •  ↑ ↓ pitch  •  SHIFT / CTRL throttle  •  MOUSE steer  •  G gear  •  F flaps  •  B brake  •  C cockpit  •  H help  •  R restart  •  P pause', w / 2, h * 0.80 + 34);
-  ctx.restore();
-}
-
-function drawEnd(ctx, w, h, kind, score, ringsGot, ringsTotal, timeSec) {
-  ctx.save();
-  ctx.fillStyle = 'rgba(8,10,24,0.55)';
-  ctx.fillRect(0, 0, w, h);
-  ctx.textAlign = 'center';
-  if (kind === 'landed') {
-    ctx.fillStyle = '#7dff9b';
-    ctx.font = 'bold 64px Arial, sans-serif';
-    ctx.fillText('TOUCHDOWN!', w / 2, h * 0.34);
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 24px Arial, sans-serif';
-    ctx.fillText('You landed Kakatua-9 on the island runway.', w / 2, h * 0.34 + 48);
-  } else {
-    ctx.fillStyle = '#ff7a5c';
-    ctx.font = 'bold 64px Arial, sans-serif';
-    ctx.fillText('CRASHED', w / 2, h * 0.34);
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 24px Arial, sans-serif';
-    ctx.fillText(kind === 'sea' ? 'Kakatua-9 ditched into the strait.'
-      : kind === 'gear' ? 'Kakatua-9 touched down gear-up — lower the gear (G) to land.'
-      : 'Kakatua-9 hit the hillside.', w / 2, h * 0.34 + 48);
-  }
-  const mm = String(Math.floor(timeSec / 60)).padStart(2, '0');
-  const ss = String(Math.floor(timeSec % 60)).padStart(2, '0');
-  ctx.font = 'bold 22px Arial, sans-serif';
-  ctx.fillStyle = '#ffe1a8';
-  ctx.fillText(`SCORE ${score}   •   RINGS ${ringsGot}/${ringsTotal}   •   TIME ${mm}:${ss}`, w / 2, h * 0.34 + 96);
-  if (kind === 'landed') {
-    // Itemised landing score: rings + landing bonus + time bonus.
-    const ringsPts = ringsGot * 100;
-    const timeBonus = Math.max(0, 300 - Math.floor(timeSec));
-    const landBonus = score - ringsPts - timeBonus;
-    ctx.font = 'bold 18px Arial, sans-serif';
-    ctx.fillStyle = '#c9d4e8';
-    ctx.fillText(`RINGS ${ringsGot} × 100 = ${ringsPts}   •   LANDING +${landBonus}   •   TIME BONUS +${timeBonus}`, w / 2, h * 0.34 + 128);
-  }
-  ctx.font = 'bold 20px Arial, sans-serif';
-  ctx.fillStyle = '#ffffff';
-  ctx.globalAlpha = 0.65 + 0.35 * Math.sin(Date.now() / 300);
-  ctx.fillText('PRESS R TO FLY AGAIN', w / 2, h * 0.34 + 168);
-  ctx.restore();
+export function titleScreenHtml() {
+  return `
+  <div class="screen-inner">
+    <div class="title-kicker">EMBER STRAIT · VOLCANIC ARCHIPELAGO FLIGHT</div>
+    <h1>EMBER STRAIT</h1>
+    <p class="title-sub">Fly the Kestrel-9 floatplane across a living volcanic strait — 8 sorties, 4 modes,
+    ring trials, island landings and a night freight run. Fuel burns, wind bites, the volcano smokes.</p>
+    <div class="title-modes"><span>RING RUN</span><span>VOLCANO SURVEY</span><span>ISLAND HOPPER</span><span>NIGHT CARGO</span></div>
+    <p class="title-keys">ENTER — fly &nbsp;·&nbsp; ARROWS pitch + bank &nbsp;SHIFT / CTRL throttle &nbsp;C camera &nbsp;1–8 missions &nbsp;?demo=1 autopilot</p>
+    <p class="title-foot">MARA VOSS on tower · THEO spotting · DR. ILYA SORN at the crater</p>
+  </div>`;
 }
